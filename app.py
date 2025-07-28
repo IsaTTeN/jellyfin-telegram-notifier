@@ -35,6 +35,7 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 JELLYFIN_BASE_URL = os.environ["JELLYFIN_BASE_URL"]
 JELLYFIN_API_KEY = os.environ["JELLYFIN_API_KEY"]
 YOUTUBE_API_KEY = os.environ["YOUTUBE_API_KEY"]
+MDBLIST_API_KEY = os.environ["MDBLIST_API_KEY"]
 EPISODE_PREMIERED_WITHIN_X_DAYS = int(os.environ["EPISODE_PREMIERED_WITHIN_X_DAYS"])
 SEASON_ADDED_WITHIN_X_DAYS = int(os.environ["SEASON_ADDED_WITHIN_X_DAYS"])
 
@@ -58,6 +59,36 @@ def save_notified_items(notified_items_to_save):
 
 notified_items = load_notified_items()
 
+
+def fetch_mdblist_ratings(content_type: str, tmdb_id: str) -> str:
+    """
+    Запрос к https://api.mdblist.com/tmdb/{type}/{tmdbId}
+    и формирование текста с найденными рейтингами.
+    Возвращает строку вида:
+      "- IMDb: 7.8\n- Rotten Tomatoes: 84%\n…"
+    или пустую строку при ошибке/отсутствии данных.
+    """
+    url = f"https://api.mdblist.com/tmdb/{content_type}/{tmdb_id}?apikey={MDBLIST_API_KEY}"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        ratings = data.get("ratings")
+        if not isinstance(ratings, list):
+            return ""
+
+        lines = []
+        for r in ratings:
+            source = r.get("source")
+            value = r.get("value")
+            if source is None or value is None:
+                continue
+            lines.append(f"- {source}: {value}")
+
+        return "\n".join(lines)
+    except requests.RequestException as e:
+        app.logger.warning(f"MDblist API error for {content_type}/{tmdb_id}: {e}")
+        return ""
 
 def send_telegram_photo(photo_id, caption):
     base_photo_url = f"{JELLYFIN_BASE_URL}/Items/{photo_id}/Images"
@@ -146,6 +177,7 @@ def announce_new_releases_from_jellyfin():
     try:
         payload = json.loads(request.data)
         item_type = payload.get("ItemType")
+        tmdb_id = payload.get("Provider_tmdb")
         item_name = payload.get("Name")
         release_year = payload.get("Year")
         series_name = payload.get("SeriesName")
@@ -166,6 +198,13 @@ def announce_new_releases_from_jellyfin():
                 notification_message = (
                     f"*🍿New Movie Added🍿*\n\n*{movie_name_cleaned}* *({release_year})*\n\n{overview}\n\n"
                     f"Runtime\n{runtime}")
+
+                if tmdb_id:
+                    # приводим тип к тому, что ждёт MDblist: movie или series
+                    mdblist_type = item_type.lower()
+                    ratings_text = fetch_mdblist_ratings(mdblist_type, tmdb_id)
+                    if ratings_text:
+                        notification_message += f"\n\n*⭐Ratings⭐:*\n{ratings_text}"
 
                 if trailer_url:
                     notification_message += f"\n\n[🎥]({trailer_url})[Trailer]({trailer_url})"
