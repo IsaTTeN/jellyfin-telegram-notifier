@@ -340,6 +340,48 @@ def announce_new_releases_from_jellyfin():
                     return (f"Episode was added more than {EPISODE_PREMIERED_WITHIN_X_DAYS} "
                             f"days ago. Not sending notification.")
 
+        if item_type == "MusicAlbum":
+            if not item_already_notified(item_type, item_name, release_year):
+                album_id = payload.get("ItemId")
+                album_name = payload.get("Name")
+                artist = payload.get("Artist")
+                year = payload.get("Year")
+                overview = payload.get("Overview")
+                runtime = payload.get("RunTime")
+                musicbrainzalbum_id = payload.get("Provider_musicbrainzalbum")
+
+                # Получаем детали, чтобы достать MusicBrainz ID
+#                album_details = get_item_details(album_id)
+#                provider_ids = album_details.get("ProviderIds", {})
+#                mb_release_id = provider_ids.get("Provider_musicbrainzalbum", "")
+
+                # Формируем ссылку на MusicBrainz, если есть ID
+                mb_link = f"https://musicbrainz.org/release/{musicbrainzalbum_id}" if musicbrainzalbum_id else ""
+
+                # Шаблон уведомления
+                notification_message = (
+                    "* 🎵 New Album Added 🎵 *\n\n"
+                    f"*{artist}*\n\n"
+                    f"*{album_name} ({year})*\n\n"
+                    f"{overview}\n\n"
+                    f"Runtime\n{runtime}\n\n"
+                    f"{f'[MusicBrainz]({mb_link})' if mb_link else ''}\n"
+                )
+
+                # Отправляем обложку альбома, если есть, иначе ничего страшного
+                response = send_telegram_photo(album_id, notification_message)
+
+                # Фиксируем уведомление как отправленное
+                mark_item_as_notified(item_type, item_name, release_year)
+
+                if response.status_code == 200:
+                    logging.info(f"(Album) {artist} – {album_name} ({year}) notification sent.")
+                    return "Album notification was sent to telegram"
+                else:
+                    # можно при падении картинки просто залогировать и вернуть успех, чтобы не спамить
+                    logging.warning(f"Album cover not found for {album_name}, sent text-only message.")
+                    return "Album notification was sent to telegram"
+
         if item_type == "Movie":
             logging.info(f"(Movie) {item_name} Notification Was Already Sent")
         elif item_type == "Season":
