@@ -270,7 +270,7 @@ def announce_new_releases_from_jellyfin():
 
                 notification_message = (
                     f"*New Season Added*\n\n*{series_name_cleaned}* *({release_year})*\n\n"
-                    f"*{season}*\n\n{overview_to_use}\n\n")
+                    f"*{season}*\n\n{overview_to_use}")
 
                 if ratings_text:
                     notification_message += f"\n\n*⭐Ratings series⭐:*\n{ratings_text}"
@@ -350,11 +350,6 @@ def announce_new_releases_from_jellyfin():
                 runtime = payload.get("RunTime")
                 musicbrainzalbum_id = payload.get("Provider_musicbrainzalbum")
 
-                # Получаем детали, чтобы достать MusicBrainz ID
-#                album_details = get_item_details(album_id)
-#                provider_ids = album_details.get("ProviderIds", {})
-#                mb_release_id = provider_ids.get("Provider_musicbrainzalbum", "")
-
                 # Формируем ссылку на MusicBrainz, если есть ID
                 mb_link = f"https://musicbrainz.org/release/{musicbrainzalbum_id}" if musicbrainzalbum_id else ""
 
@@ -363,7 +358,7 @@ def announce_new_releases_from_jellyfin():
                     "* 🎵 New Album Added 🎵 *\n\n"
                     f"*{artist}*\n\n"
                     f"*{album_name} ({year})*\n\n"
-                    f"{overview}\n\n"
+                    f"{overview and overview + '\n\n' or ''}"
                     f"Runtime\n{runtime}\n\n"
                     f"{f'[MusicBrainz]({mb_link})' if mb_link else ''}\n"
                 )
