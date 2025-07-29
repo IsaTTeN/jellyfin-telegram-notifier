@@ -1,8 +1,6 @@
-FROM python:3.11-slim-bookworm
+FROM python:3.13-slim-bookworm
 
-LABEL maintainer="fahmula"
-
-RUN adduser pythonapp
+LABEL maintainer="druidblack"
 
 WORKDIR /app
 
@@ -10,18 +8,12 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends curl iputils-ping && \
     rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /app/
+COPY requirements.txt ./
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . /app/
-
-RUN chown -R pythonapp:pythonapp /app
-
-ENV PYTHONUNBUFFERED=1
-
-USER pythonapp
+COPY . .
 
 EXPOSE 5000
 
-CMD ["gunicorn", "-w", "1", "-b", "0.0.0.0:5000", "app:app"]
+CMD ["python", "app.py"]
