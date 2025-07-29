@@ -36,8 +36,12 @@ JELLYFIN_BASE_URL = os.environ["JELLYFIN_BASE_URL"]
 JELLYFIN_API_KEY = os.environ["JELLYFIN_API_KEY"]
 YOUTUBE_API_KEY = os.environ["YOUTUBE_API_KEY"]
 MDBLIST_API_KEY = os.environ["MDBLIST_API_KEY"]
+TMDB_API_KEY = os.environ["TMDB_API_KEY"]
+TMDB_SEARCH_URL = "https://api.themoviedb.org/3/search/tv"
 EPISODE_PREMIERED_WITHIN_X_DAYS = int(os.environ["EPISODE_PREMIERED_WITHIN_X_DAYS"])
 SEASON_ADDED_WITHIN_X_DAYS = int(os.environ["SEASON_ADDED_WITHIN_X_DAYS"])
+#выключить логику пропуска по датам
+#DEBUG_DISABLE_DATE_CHECKS = True
 
 # Path for the JSON file to store notified items
 notified_items_file = '/app/data/notified_items.json'
@@ -89,6 +93,31 @@ def fetch_mdblist_ratings(content_type: str, tmdb_id: str) -> str:
     except requests.RequestException as e:
         app.logger.warning(f"MDblist API error for {content_type}/{tmdb_id}: {e}")
         return ""
+
+def get_tmdb_id(series_name: str, release_year: int) -> str:
+    """
+    Поиск сериала в TMDb и возврат первого найденного TV ID.
+    Если ничего не найдено — возвращает "N/A".
+    """
+    params = {
+        "api_key": TMDB_API_KEY,
+        "query": series_name,
+        "first_air_date_year": release_year,
+        "language": "en-US",
+        "page": 1
+    }
+    try:
+        resp = requests.get(TMDB_SEARCH_URL, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        results = data.get("results", [])
+        if not results:
+            logging.warning(f"TMDb: не найден сериал «{series_name} ({release_year})»")
+            return "N/A"
+        return str(results[0]["id"])
+    except requests.RequestException as e:
+        logging.error(f"Ошибка при запросе TMDb для «{series_name}»: {e}")
+        return "N/A"
 
 def send_telegram_photo(photo_id, caption):
     base_photo_url = f"{JELLYFIN_BASE_URL}/Items/{photo_id}/Images"
@@ -204,7 +233,7 @@ def announce_new_releases_from_jellyfin():
                     mdblist_type = item_type.lower()
                     ratings_text = fetch_mdblist_ratings(mdblist_type, tmdb_id)
                     if ratings_text:
-                        notification_message += f"\n\n*⭐Ratings⭐:*\n{ratings_text}"
+                        notification_message += f"\n\n*⭐Ratings movie⭐:*\n{ratings_text}"
 
                 if trailer_url:
                     notification_message += f"\n\n[🎥]({trailer_url})[Trailer]({trailer_url})"
@@ -225,6 +254,16 @@ def announce_new_releases_from_jellyfin():
                 # Remove release_year from series_name if present
                 series_name_cleaned = series_name.replace(f" ({release_year})", "").strip()
 
+                trailer_url = get_youtube_trailer_url(f"{series_name_cleaned} Trailer {release_year}")
+
+                # Get TMDb ID via external API
+                tmdb_id = get_tmdb_id(series_name_cleaned, release_year)
+
+                # **Новые строки**: получаем рейтинги для сериала
+                ratings_text = fetch_mdblist_ratings("show", tmdb_id)
+                # Если есть рейтинги — добавляем пустую строку после них
+                ratings_section = f"{ratings_text}\n\n" if ratings_text else ""
+
                 # Get series overview if season overview is empty
                 overview_to_use = payload.get("Overview") if payload.get("Overview") else series_details["Items"][0].get(
                     "Overview")
@@ -232,6 +271,12 @@ def announce_new_releases_from_jellyfin():
                 notification_message = (
                     f"*New Season Added*\n\n*{series_name_cleaned}* *({release_year})*\n\n"
                     f"*{season}*\n\n{overview_to_use}\n\n")
+
+                if ratings_text:
+                    notification_message += f"\n\n*⭐Ratings series⭐:*\n{ratings_text}"
+
+                if trailer_url:
+                    notification_message += f"\n\n[🎥]({trailer_url})[Trailer]({trailer_url})"
 
                 response = send_telegram_photo(season_id, notification_message)
 
@@ -259,6 +304,7 @@ def announce_new_releases_from_jellyfin():
                 epi_name = item_name
                 overview = payload.get("Overview")
 
+#                if not DEBUG_DISABLE_DATE_CHECKS:
                 if not is_not_within_last_x_days(season_date_created, SEASON_ADDED_WITHIN_X_DAYS):
                     logging.info(f"(Episode) {series_name} Season {season_num} "
                                  f"was added within the last {SEASON_ADDED_WITHIN_X_DAYS} "
