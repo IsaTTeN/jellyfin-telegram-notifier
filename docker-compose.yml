@@ -2,19 +2,16 @@ version: '3'
 services:
   jellyfin-telegram-notifier:
     container_name: jellyfin-telegram-notifier
-    image: fahmula/jellyfin-telegram-notifier
+    image: druidblack/jellyfin-telegram-notifie:latest
     ports:
       - "5000:5000"  # Map host port 5000 to container port 5000
-    volumes:
-      - /app/log:/app/log  # Map the host directory to the container directory for logs
-      - /app/data:/app/data  # Map the host directory to the container directory for json data
     environment:
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
-      - JELLYFIN_BASE_URL=${JELLYFIN_BASE_URL}
-      - JELLYFIN_API_KEY=${JELLYFIN_API_KEY}
-      - YOUTUBE_API_KEY=${YOUTUBE_API_KEY}
-      - SEASON_ADDED_WITHIN_X_DAYS=${SEASON_ADDED_WITHIN_X_DAYS}
-      - EPISODE_PREMIERED_WITHIN_X_DAYS=${EPISODE_PREMIERED_WITHIN_X_DAYS}
-    env_file:
-      - .env
+      - TELEGRAM_BOT_TOKEN=9059476951:AAGgchDa2cQq0XYK3Uki2IsGpQk1g4hPD7
+      - TELEGRAM_CHAT_ID=501990748
+      - JELLYFIN_BASE_URL=http://192.168.1.161:8096
+      - JELLYFIN_API_KEY=wq0ac26fb67e4bb4a8185fb302923296
+      - MDBLIST_API_KEY=wq000002er0urju0fdhjb0tp
+      - TMDB_API_KEY=9ebb4bcd533519ew2c00ba8f000e000e
+      - YOUTUBE_API_KEY=AIzTSygtyBFfMbzo8LTfwF8DDTmZshkFhaA8wWg
+      - SEASON_ADDED_WITHIN_X_DAYS=3
+      - EPISODE_PREMIERED_WITHIN_X_DAYS=7
