@@ -46,19 +46,24 @@ SEASON_ADDED_WITHIN_X_DAYS = int(os.environ["SEASON_ADDED_WITHIN_X_DAYS"])
 # Path for the JSON file to store notified items
 notified_items_file = '/app/data/notified_items.json'
 
+# Убедимся, что папка /app/data существует
+os.makedirs(os.path.dirname(notified_items_file), exist_ok=True)
 
 # Function to load notified items from the JSON file
 def load_notified_items():
+    # Если файл есть — читаем
     if os.path.exists(notified_items_file):
-        with open(notified_items_file, 'r') as file:
+        with open(notified_items_file, 'r', encoding='utf-8') as file:
             return json.load(file)
+    # Иначе — создаём пустой JSON и возвращаем пустой словарь
+    with open(notified_items_file, 'w', encoding='utf-8') as file:
+        json.dump({}, file, ensure_ascii=False, indent=2)
     return {}
-
 
 # Function to save notified items to the JSON file
 def save_notified_items(notified_items_to_save):
-    with open(notified_items_file, 'w') as file:
-        json.dump(notified_items_to_save, file)
+    with open(notified_items_file, 'w', encoding='utf-8') as file:
+        json.dump(notified_items_to_save, file, ensure_ascii=False, indent=2)
 
 
 notified_items = load_notified_items()
@@ -273,7 +278,7 @@ def announce_new_releases_from_jellyfin():
                     f"*{season}*\n\n{overview_to_use}")
 
                 if ratings_text:
-                    notification_message += f"\n\n*⭐Ratings series⭐:*\n{ratings_text}"
+                    notification_message += f"\n\n*⭐Ratings show⭐:*\n{ratings_text}"
 
                 if trailer_url:
                     notification_message += f"\n\n[🎥]({trailer_url})[Trailer]({trailer_url})"
