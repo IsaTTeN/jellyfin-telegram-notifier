@@ -88,7 +88,7 @@ services:
 5. Input the `MDBLIST_API_KEY` into the application's environment variables.
 
 ## Setting Up TheMovieDB API Key
-1. Go to the [TheMovieDB](https://www.themoviedb.org0.
+1. Go to the [TheMovieDB](https://www.themoviedb.org).
 2. Log in to the website.
 3. Go to the https://www.themoviedb.org/settings/api .
 4. Copy the generated API key.
