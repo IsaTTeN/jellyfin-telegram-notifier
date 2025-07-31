@@ -38,6 +38,7 @@ YOUTUBE_API_KEY = os.environ["YOUTUBE_API_KEY"]
 MDBLIST_API_KEY = os.environ["MDBLIST_API_KEY"]
 TMDB_API_KEY = os.environ["TMDB_API_KEY"]
 TMDB_SEARCH_URL = "https://api.themoviedb.org/3/search/tv"
+LANGUAGE = os.environ["LANGUAGE"]
 EPISODE_PREMIERED_WITHIN_X_DAYS = int(os.environ["EPISODE_PREMIERED_WITHIN_X_DAYS"])
 SEASON_ADDED_WITHIN_X_DAYS = int(os.environ["SEASON_ADDED_WITHIN_X_DAYS"])
 #выключить логику пропуска по датам
@@ -68,6 +69,44 @@ def save_notified_items(notified_items_to_save):
 
 notified_items = load_notified_items()
 
+# 2. Словарь переводов
+MESSAGES = {
+    "en": {
+        "new_movie_title": "🍿New Movie Added🍿",
+        "new_season_title": "📺New Season Added📺",
+        "new_episode_title": "📺New Episode Added📺",
+        "new_album_title": "🎵New Album Added🎵",
+        "new_runtime": "🕒Runtime🕒",
+        "new_ratings_movie": "⭐Ratings movie⭐",
+        "new_ratings_show": "⭐Ratings show⭐",
+        "new_trailer": "Trailer",
+        "new_release_date": "Release Date",
+        "new_series": "Series",
+        "new_episode_t": "Episode Title",
+    },
+    "ru": {
+        "new_movie_title": "🍿Новый фильм добавлен🍿",
+        "new_season_title": "📺Новый сезон добавлен📺",
+        "new_episode_title": "📺Новый эпизод добавлен📺",
+        "new_album_title": "🎵Новый альбом добавлен🎵",
+        "new_runtime": "🕒Продолжительность🕒",
+        "new_ratings_movie": "⭐Рейтинги фильма⭐",
+        "new_ratings_show": "⭐Рейтинги сериала⭐",
+        "new_trailer": "Трейлер",
+        "new_release_date": "Дата выхода",
+        "new_series": "Сериал",
+        "new_episode_t": "Название эпизода",
+    }
+}
+#Выбираем рабочий язык: если заданный отсутствует в MESSAGES — ставим en
+LANG = LANGUAGE if LANGUAGE in MESSAGES else "en"
+
+def t(key: str) -> str:
+    """
+    Возвращает перевод по ключу для текущего языка LANG.
+    Если ключ отсутствует — падает KeyError, чтобы вы не пропустили необходимость перевода.
+    """
+    return MESSAGES[LANG][key]
 
 def fetch_mdblist_ratings(content_type: str, tmdb_id: str) -> str:
     """
@@ -230,18 +269,18 @@ def announce_new_releases_from_jellyfin():
                 trailer_url = get_youtube_trailer_url(f"{movie_name_cleaned} Trailer {release_year}")
 
                 notification_message = (
-                    f"*🍿New Movie Added🍿*\n\n*{movie_name_cleaned}* *({release_year})*\n\n{overview}\n\n"
-                    f"Runtime\n{runtime}")
+                    f"*{t('new_movie_title')}*\n\n*{movie_name_cleaned}* *({release_year})*\n\n{overview}\n\n"
+                    f"{t('new_runtime')}\n{runtime}")
 
                 if tmdb_id:
                     # приводим тип к тому, что ждёт MDblist: movie или series
                     mdblist_type = item_type.lower()
                     ratings_text = fetch_mdblist_ratings(mdblist_type, tmdb_id)
                     if ratings_text:
-                        notification_message += f"\n\n*⭐Ratings movie⭐:*\n{ratings_text}"
+                        notification_message += f"\n\n*{t('new_ratings_movie')}*\n{ratings_text}"
 
                 if trailer_url:
-                    notification_message += f"\n\n[🎥]({trailer_url})[Trailer]({trailer_url})"
+                    notification_message += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
 
                 send_telegram_photo(movie_id, notification_message)
                 mark_item_as_notified(item_type, item_name, release_year)
@@ -274,14 +313,14 @@ def announce_new_releases_from_jellyfin():
                     "Overview")
 
                 notification_message = (
-                    f"*New Season Added*\n\n*{series_name_cleaned}* *({release_year})*\n\n"
+                    f"*{t('new_season_title')}*\n\n*{series_name_cleaned}* *({release_year})*\n\n"
                     f"*{season}*\n\n{overview_to_use}")
 
                 if ratings_text:
-                    notification_message += f"\n\n*⭐Ratings show⭐:*\n{ratings_text}"
+                    notification_message += f"\n\n*{t('new_ratings_show')}*\n{ratings_text}"
 
                 if trailer_url:
-                    notification_message += f"\n\n[🎥]({trailer_url})[Trailer]({trailer_url})"
+                    notification_message += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
 
                 response = send_telegram_photo(season_id, notification_message)
 
@@ -321,8 +360,8 @@ def announce_new_releases_from_jellyfin():
                                                                    EPISODE_PREMIERED_WITHIN_X_DAYS):
 
                     notification_message = (
-                        f"*New Episode Added*\n\n*Release Date*: {episode_premiere_date}\n\n*Series*: {series_name} *S*"
-                        f"{season_num}*E*{season_epi}\n*Episode Title*: {epi_name}\n\n{overview}\n\n"
+                        f"*{t('new_episode_title')}*\n\n*{t('new_release_date')}*: {episode_premiere_date}\n\n*{t('new_series')}*: {series_name} *S*"
+                        f"{season_num}*E*{season_epi}\n*{t('new_episode_t')}*: {epi_name}\n\n{overview}\n\n"
                     )
                     response = send_telegram_photo(season_id, notification_message)
 
@@ -360,11 +399,11 @@ def announce_new_releases_from_jellyfin():
 
                 # Шаблон уведомления
                 notification_message = (
-                    "* 🎵 New Album Added 🎵 *\n\n"
+                    "*{t('new_album_title')}*\n\n"
                     f"*{artist}*\n\n"
                     f"*{album_name} ({year})*\n\n"
                     f"{overview and overview + '\n\n' or ''}"
-                    f"Runtime\n{runtime}\n\n"
+                    f"{t('new_runtime')}\n{runtime}\n\n"
                     f"{f'[MusicBrainz]({mb_link})' if mb_link else ''}\n"
                 )
 
