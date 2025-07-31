@@ -1,19 +1,24 @@
-# Jellyfin Notification System
+<div align="center">
+  <img src="readme_images/JTN.png" alt="Jellyfin Notification System" width="512">
+  <h1>Jellyfin Notification System</h1>
+</div>
 
-A simple Flask application that sends notifications to Telegram whenever new content (movies, series, seasons, episodes) is added to Jellyfin.
+A simple Flask application that sends notifications to Telegram whenever new content (movies, series, seasons, episodes, album) is added to Jellyfin.
 
 ---
 
 ## Features
 
-- Sends Telegram notifications with media images whenever a new movie, series, season, or episode is added to Jellyfin.
+- Sends Telegram notifications with media images whenever a new movie, series, season, episode or album is added to Jellyfin.
 - Integrates with the Jellyfin webhook plugin.
 - Provides a filter to notify only for recent episodes or newly added seasons.
+- Shows ratings from popular platforms for added movies and series.
 
 ## Prerequisites
 
-- A Jellyfin server with the Webhook plugin installed.
+- A Jellyfin server with the Webhook, TMDb plugins and installed.
 - A Telegram bot token and chat ID (see the section on setting up a Telegram bot below).
+- API KEY for MDBLIST, TMDB and Youtube
 - Docker (optional, for Docker installation).
 
 ## Installation
@@ -22,15 +27,12 @@ A simple Flask application that sends notifications to Telegram whenever new con
 
 1. Clone the repository.
 2. Install the requirements using `pip install -r requirements.txt`.
-3. Set up your environment variables. (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, JELLYFIN_BASE_URL, JELLYFIN_API_KEY, YOUTUBE_API_KEY, EPISODE_PREMIERED_WITHIN_X_DAYS, SEASON_ADDED_WITHIN_X_DAYS).
-4. Run the application using `python3 main.py`.
+3. Set up your environment variables. (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, JELLYFIN_BASE_URL, JELLYFIN_API_KEY, YOUTUBE_API_KEY, MDBLIST_API_KEY, TMDB_API_KEY, EPISODE_PREMIERED_WITHIN_X_DAYS, SEASON_ADDED_WITHIN_X_DAYS).
+4. Run the application using `python3 app.py`.
 
 ### Docker Installation
 
 If you have Docker and Docker Compose installed, you can use the provided `docker-compose.yml`
-
-1. Set up your environment variables in a `.env` file.
-2. Run `docker-compose up`.
 
 ## Setting Up a Telegram Bot
 
