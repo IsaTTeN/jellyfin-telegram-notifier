@@ -106,6 +106,9 @@ services:
 6. For `Item Type`, select `Movie, Episode, Season, Album`.
 7. Make sure to enable the `Send All Properties (ignores template)` option.
 
+![webhook1](https://github.com/Druidblack/jellyfin-telegram-notifier/blob/main/readme_images/weebhook1.jpg) ![webhook2](https://github.com/Druidblack/jellyfin-telegram-notifier/blob/main/readme_images/webhook2.jpg)
+
+
 #### Environment Variables Explanation:
 
 - **`EPISODE_PREMIERED_WITHIN_X_DAYS`**:
