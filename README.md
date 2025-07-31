@@ -5,6 +5,10 @@
 
 A simple Flask application that sends notifications to Telegram whenever new content (movies, series, seasons, episodes, album) is added to Jellyfin.
 
+<div align="center">
+  <img src="readme_images/gge5e0762f1e.gif" alt="example">
+</div>
+
 ---
 
 ## Features
@@ -13,6 +17,7 @@ A simple Flask application that sends notifications to Telegram whenever new con
 - Integrates with the Jellyfin webhook plugin.
 - Provides a filter to notify only for recent episodes or newly added seasons.
 - Shows ratings from popular platforms for added movies and series.
+- Adds a youtube link to the message with a trailer for a movie or series.
 
 ## Prerequisites
 
@@ -34,6 +39,26 @@ A simple Flask application that sends notifications to Telegram whenever new con
 
 If you have Docker and Docker Compose installed, you can use the provided `docker-compose.yml`
 
+```
+version: '3'
+services:
+  jellyfin-telegram-notifier:
+    container_name: jellyfin-telegram-notifier
+    image: druidblack/jellyfin-telegram-notifie:latest
+    ports:
+      - "5000:5000"  # Map host port 5000 to container port 5000
+    environment:
+      - TELEGRAM_BOT_TOKEN=9059476951:AAGgchDa2cQq0XYK3Uki2IsGpQk1g4hPD7
+      - TELEGRAM_CHAT_ID=501990748
+      - JELLYFIN_BASE_URL=http://192.168.1.161:8096
+      - JELLYFIN_API_KEY=wq0ac26fb67e4bb4a8185fb302923296
+      - MDBLIST_API_KEY=wq000002er0urju0fdhjb0tp
+      - TMDB_API_KEY=9ebb4bcd533519ew2c00ba8f000e000e
+      - YOUTUBE_API_KEY=AIzTSygtyBFfMbzo8LTfwF8DDTmZshkFhaA8wWg
+      - SEASON_ADDED_WITHIN_X_DAYS=3
+      - EPISODE_PREMIERED_WITHIN_X_DAYS=7
+```
+
 ## Setting Up a Telegram Bot
 
 1. Start a Chat with BotFather on Telegram.
@@ -44,6 +69,31 @@ If you have Docker and Docker Compose installed, you can use the provided `docke
 6. Get your chat ID by starting a chat with your bot, sending a message, then visiting `https://api.telegram.org/botYOUR_BOT_TOKEN/getUpdates` to find the chat ID in the returned JSON.
 7. Input the Bot Token and Chat ID into the application's environment variables.
 
+## Setting Up YouTube API Key
+
+1. Go to the [Google Cloud Console](https://console.cloud.google.com/).
+2. Create a new project or use an existing one.
+3. Enable the "YouTube Data API v3" for your project.
+4. Create credentials for your project:
+   - Go to the "Credentials" tab.
+   - Click on "Create Credentials" and select "API Key".
+5. Copy the generated API key.
+6. Input the `YOUTUBE_API_KEY` into the application's environment variables.
+
+## Setting Up Mdblist API Key
+1. Go to the [mdblist.com](https://mdblist.com).
+2. Log in to the website.
+3. Go to the https://mdblist.com/preferences .
+4. Copy the generated API key.
+5. Input the `MDBLIST_API_KEY` into the application's environment variables.
+
+## Setting Up TheMovieDB API Key
+1. Go to the [TheMovieDB](https://www.themoviedb.org0.
+2. Log in to the website.
+3. Go to the https://www.themoviedb.org/settings/api .
+4. Copy the generated API key.
+5. Input the `TMDB_API_KEY` into the application's environment variables.
+
 ## Usage
 
 ### Setting up Jellyfin Webhook
@@ -53,7 +103,7 @@ If you have Docker and Docker Compose installed, you can use the provided `docke
 3. Choose `Webhook` and add a new webhook.
 4. Set the server to the Flask application's endpoint (e.g., `http://localhost:5000/webhook`).
 5. For `Notification Type`, select `Item Added`.
-6. For `Item Type`, select `Movie, Episode, Season`.
+6. For `Item Type`, select `Movie, Episode, Season, Album`.
 7. Make sure to enable the `Send All Properties (ignores template)` option.
 
 #### Environment Variables Explanation:
@@ -63,19 +113,6 @@ If you have Docker and Docker Compose installed, you can use the provided `docke
 
 - **`SEASON_ADDED_WITHIN_X_DAYS`**:
   Dictates the threshold for sending notifications based on when a season was added to Jellyfin. If set to `3`, then if a season was added within the last 3 days, episode notifications will not be sent to avoid potential spam from adding an entire season at once.
-
-### Setting Up YouTube API Key (Optional)
-
-If you want to fetch YouTube trailer URLs for movies, you can set up a YouTube API key:
-
-1. Go to the [Google Cloud Console](https://console.cloud.google.com/).
-2. Create a new project or use an existing one.
-3. Enable the "YouTube Data API v3" for your project.
-4. Create credentials for your project:
-   - Go to the "Credentials" tab.
-   - Click on "Create Credentials" and select "API Key".
-5. Copy the generated API key.
-6. Set the `YOUTUBE_API_KEY` environment variable in your `.env` file to the copied API key.
 
 ## Contributing
 
