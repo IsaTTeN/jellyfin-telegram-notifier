@@ -41,6 +41,7 @@ JELLYFIN_API_KEY = os.environ["JELLYFIN_API_KEY"]
 YOUTUBE_API_KEY = os.environ["YOUTUBE_API_KEY"]
 MDBLIST_API_KEY = os.environ["MDBLIST_API_KEY"]
 IMGBB_API_KEY = os.environ["IMGBB_API_KEY"]
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 TMDB_API_KEY = os.environ["TMDB_API_KEY"]
 TMDB_SEARCH_URL = "https://api.themoviedb.org/3/search/tv"
 LANGUAGE = os.environ["LANGUAGE"]
@@ -210,6 +211,41 @@ def get_jellyfin_image_and_upload_imgbb(photo_id):
         logging.warning(f"Ошибка скачивания из Jellyfin: {ex}")
         return None
 
+def send_discord_message(photo_id, message, title="Jellyfin"):
+    """
+    Отправляет уведомление (текст и картинку) в Discord через Webhook.
+    Картинка — из imgbb, как и для Gotify.
+    """
+    if not DISCORD_WEBHOOK_URL:
+        logging.warning("DISCORD_WEBHOOK_URL not set, skipping Discord notification.")
+        return None
+
+    # Получаем ссылку на картинку (imgbb)
+    uploaded_url = get_jellyfin_image_and_upload_imgbb(photo_id)
+
+    data = {
+        "username": title,
+        "content": message
+    }
+
+    # Если есть картинка — добавляем embed с изображением
+    if uploaded_url:
+        data["embeds"] = [
+            {
+                "image": {"url": uploaded_url}
+            }
+        ]
+
+    try:
+        response = requests.post(DISCORD_WEBHOOK_URL, json=data)
+        response.raise_for_status()
+        logging.info("Discord notification sent successfully")
+        return response
+    except Exception as ex:
+        logging.warning(f"Error sending to Discord: {ex}")
+        return None
+
+
 def clean_markdown_for_apprise(text):
     """
     Упрощает markdown-подобные уведомления для plain text:
@@ -249,6 +285,15 @@ def send_notification(photo_id, caption):
             logging.info("Notification sent via Gotify")
         else:
             logging.warning("Notification failed via Gotify")
+
+    # ======= ДОБАВЛЕНО ДЛЯ DISCORD =======
+    if DISCORD_WEBHOOK_URL:
+        discord_response = send_discord_message(photo_id, caption)
+        if discord_response and discord_response.ok:
+            logging.info("Notification sent via Discord")
+        else:
+            logging.warning("Notification failed via Discord")
+    # =====================================
 
     other_services = [url for url in APPRISE_URLS.split() if url]  # убираем пустые строки
     if other_services:
