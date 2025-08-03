@@ -4,12 +4,15 @@ from datetime import datetime, timedelta
 import os
 import json
 import requests
+import tempfile
+import re
+import base64
 from requests.exceptions import HTTPError
 from flask import Flask, request
 from dotenv import load_dotenv
+from apprise import Apprise
 
 load_dotenv()
-
 app = Flask(__name__)
 
 # Set up logging
@@ -28,14 +31,16 @@ rotating_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %
 # Add the rotating handler to the logger
 logging.getLogger().addHandler(rotating_handler)
 
-
 # Constants
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+GOTIFY_URL = os.environ.get("GOTIFY_URL", "")
+GOTIFY_TOKEN = os.environ.get("GOTIFY_TOKEN", "")
 JELLYFIN_BASE_URL = os.environ["JELLYFIN_BASE_URL"]
 JELLYFIN_API_KEY = os.environ["JELLYFIN_API_KEY"]
 YOUTUBE_API_KEY = os.environ["YOUTUBE_API_KEY"]
 MDBLIST_API_KEY = os.environ["MDBLIST_API_KEY"]
+IMGBB_API_KEY = os.environ["IMGBB_API_KEY"]
 TMDB_API_KEY = os.environ["TMDB_API_KEY"]
 TMDB_SEARCH_URL = "https://api.themoviedb.org/3/search/tv"
 LANGUAGE = os.environ["LANGUAGE"]
@@ -43,6 +48,15 @@ EPISODE_PREMIERED_WITHIN_X_DAYS = int(os.environ["EPISODE_PREMIERED_WITHIN_X_DAY
 SEASON_ADDED_WITHIN_X_DAYS = int(os.environ["SEASON_ADDED_WITHIN_X_DAYS"])
 #выключить логику пропуска по датам
 #DEBUG_DISABLE_DATE_CHECKS = True
+
+# Gotify больше не добавляем в APPRISE_URLS вообще!
+APPRISE_OTHER_URLS = os.environ.get("APPRISE_OTHER_URLS", "")
+APPRISE_URLS = APPRISE_OTHER_URLS.strip()
+
+
+apobj = Apprise()
+for url in APPRISE_URLS.split():
+    apobj.add(url)
 
 # Path for the JSON file to store notified items
 notified_items_file = '/app/data/notified_items.json'
@@ -163,6 +177,122 @@ def get_tmdb_id(series_name: str, release_year: int) -> str:
         logging.error(f"Ошибка при запросе TMDb для «{series_name}»: {e}")
         return "N/A"
 
+def upload_image_to_imgbb(image_bytes):
+    """
+    Загружает изображение на imgbb.com и возвращает прямую ссылку на изображение.
+    """
+    url = "https://api.imgbb.com/1/upload"
+    payload = {
+        "key": IMGBB_API_KEY,
+        "image": base64.b64encode(image_bytes).decode('utf-8')
+    }
+    try:
+        response = requests.post(url, data=payload)
+        response.raise_for_status()
+        data = response.json()
+        img_url = data['data']['url']
+        logging.info(f"Изображение успешно загружено на imgbb: {img_url}")
+        return img_url
+    except Exception as ex:
+        logging.warning(f"Ошибка загрузки на imgbb: {ex}")
+        return None
+
+def get_jellyfin_image_and_upload_imgbb(photo_id):
+    """
+    Скачивает изображение из Jellyfin и загружает его на imgbb, возвращая публичную ссылку.
+    """
+    jellyfin_image_url = f"{JELLYFIN_BASE_URL}/Items/{photo_id}/Images/Primary"
+    try:
+        resp = requests.get(jellyfin_image_url)
+        resp.raise_for_status()
+        return upload_image_to_imgbb(resp.content)
+    except Exception as ex:
+        logging.warning(f"Ошибка скачивания из Jellyfin: {ex}")
+        return None
+
+def clean_markdown_for_apprise(text):
+    """
+    Упрощает markdown-подобные уведомления для plain text:
+    - убирает *жирный* и _курсив_
+    - превращает ссылки [название](url) в 'название: url'
+    - убирает двойные/одиночные пробелы у краёв строк
+    - оставляет эмодзи
+    """
+    # Преобразовать [текст](ссылка) в 'текст: ссылка'
+    text = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'\1: \2', text)
+
+    # Убрать *жирный* и _курсив_
+    text = re.sub(r'(\*|_){1,3}(.+?)\1{1,3}', r'\2', text)
+
+    # Убрать лишние пробелы по краям
+    text = '\n'.join([line.strip() for line in text.split('\n')])
+
+    # При желании можно убрать любые другие "технические" символы
+
+    return text
+
+def send_notification(photo_id, caption):
+    """
+    1. Всегда отправляет в Telegram напрямую (send_telegram_photo).
+    2. Независимо — отправляет напрямую в Gotify (если включен).
+    3. Остальные сервисы — через Apprise.
+    """
+    tg_response = send_telegram_photo(photo_id, caption)
+#    tg_GOTIFY = send_gotify_message(photo_id, caption)
+
+    # Gotify: только если параметры заданы
+#    gotify_message = clean_markdown_for_apprise(caption)
+#    gotify_response = None
+    if GOTIFY_URL and GOTIFY_TOKEN:
+        gotify_response = send_gotify_message(photo_id, caption)
+        if gotify_response and gotify_response.ok:
+            logging.info("Notification sent via Gotify")
+        else:
+            logging.warning("Notification failed via Gotify")
+
+    other_services = [url for url in APPRISE_URLS.split() if url]  # убираем пустые строки
+    if other_services:
+        apprise_obj = Apprise()
+        for url in other_services:
+            apprise_obj.add(url)
+
+        # Готовим временный файл для картинки (если фото есть)
+
+    base_photo_url = f"{JELLYFIN_BASE_URL}/Items/{photo_id}/Images/Primary"
+    attach_param = None
+    try:
+        image_response = requests.get(base_photo_url)
+        if image_response.ok:
+            # Сохраняем изображение во временный файл
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+                tmp.write(image_response.content)
+                tmp_path = tmp.name
+            attach_param = tmp_path
+        else:
+            attach_param = None
+    except Exception as ex:
+        logging.warning(f"Cannot download image: {ex}")
+        attach_param = None
+
+    caption_plain = clean_markdown_for_apprise(caption)
+    result = apobj.notify(
+        body=caption_plain,
+        title="",
+        attach=attach_param
+    )
+
+    if attach_param and os.path.exists(attach_param):
+        try:
+            os.remove(attach_param)
+        except Exception as ex:
+            logging.warning(f"Cannot remove temp image: {ex}")
+
+    if result:
+        logging.info("Notification sent via Apprise")
+    else:
+        logging.warning("Notification failed via Apprise")
+    return tg_response
+
 def send_telegram_photo(photo_id, caption):
     base_photo_url = f"{JELLYFIN_BASE_URL}/Items/{photo_id}/Images"
     primary_photo_url = f"{base_photo_url}/Primary"
@@ -182,6 +312,44 @@ def send_telegram_photo(photo_id, caption):
     response = requests.post(url, data=data, files=files)
     return response
 
+def send_gotify_message(photo_id, message, title="Jellyfin", priority=5 ):
+    """
+    Отправка сообщения и картинки напрямую в Gotify.
+    """
+    if not GOTIFY_URL or not GOTIFY_TOKEN:
+        logging.warning("GOTIFY_URL or GOTIFY_TOKEN not set, skipping Gotify notification.")
+        return None
+
+    uploaded_url = get_jellyfin_image_and_upload_imgbb(photo_id)
+    if uploaded_url:
+        message = f"[![Poster]({uploaded_url})]({uploaded_url})\n\n{message}"
+        big_image_url = uploaded_url
+    else:
+        big_image_url = None
+
+    gotify_url = GOTIFY_URL.rstrip('/')
+    url = f"{gotify_url}/message?token={GOTIFY_TOKEN}"
+
+    data = {
+        "title": title,
+        "message": message,
+        "priority": priority,
+        "extras": {
+            "client::display": {"contentType": "text/markdown"}
+        }
+    }
+    if big_image_url:
+        data["extras"]["client::notification"] = {"bigImageUrl": big_image_url}
+    headers = {"X-Gotify-Format": "markdown"}
+
+    try:
+        response = requests.post(url, json=data, headers=headers)
+        response.raise_for_status()
+        logging.info("Gotify notification sent successfully")
+        return response
+    except Exception as ex:
+        logging.warning(f"Error sending to Gotify: {ex}")
+        return None
 
 def get_item_details(item_id):
     headers = {'accept': 'application/json', }
@@ -282,7 +450,9 @@ def announce_new_releases_from_jellyfin():
                 if trailer_url:
                     notification_message += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
 
-                send_telegram_photo(movie_id, notification_message)
+#                notification_message_plain = clean_markdown_for_apprise(notification_message)
+
+                send_notification(movie_id, notification_message)
                 mark_item_as_notified(item_type, item_name, release_year)
                 logging.info(f"(Movie) {movie_name} {release_year} "
                              f"notification was sent to telegram.")
@@ -322,7 +492,7 @@ def announce_new_releases_from_jellyfin():
                 if trailer_url:
                     notification_message += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
 
-                response = send_telegram_photo(season_id, notification_message)
+                response = send_notification(season_id, notification_message)
 
                 if response.status_code == 200:
                     mark_item_as_notified(item_type, item_name, release_year)
@@ -330,7 +500,7 @@ def announce_new_releases_from_jellyfin():
                                  f"notification was sent to telegram.")
                     return "Season notification was sent to telegram"
                 else:
-                    send_telegram_photo(series_id, notification_message)
+                    send_notification(series_id, notification_message)
                     mark_item_as_notified(item_type, item_name, release_year)
                     logging.warning(f"{series_name_cleaned} {season} image does not exists, falling back to series image")
                     logging.info(f"(Season) {series_name_cleaned} {season} notification was sent to telegram")
@@ -363,14 +533,14 @@ def announce_new_releases_from_jellyfin():
                         f"*{t('new_episode_title')}*\n\n*{t('new_release_date')}*: {episode_premiere_date}\n\n*{t('new_series')}*: {series_name} *S*"
                         f"{season_num}*E*{season_epi}\n*{t('new_episode_t')}*: {epi_name}\n\n{overview}\n\n"
                     )
-                    response = send_telegram_photo(season_id, notification_message)
+                    response = send_notification(season_id, notification_message)
 
                     if response.status_code == 200:
                         mark_item_as_notified(item_type, item_name, release_year)
                         logging.info(f"(Episode) {series_name} S{season_num}E{season_epi} notification sent to Telegram!")
                         return "Notification sent to Telegram!"
                     else:
-                        send_telegram_photo(series_id, notification_message)
+                        send_notification(series_id, notification_message)
                         logging.warning(f"(Episode) {series_name} season image does not exists, "
                                         f"falling back to series image")
                         mark_item_as_notified(item_type, item_name, release_year)
@@ -408,7 +578,7 @@ def announce_new_releases_from_jellyfin():
                 )
 
                 # Отправляем обложку альбома, если есть, иначе ничего страшного
-                response = send_telegram_photo(album_id, notification_message)
+                response = send_notification(album_id, notification_message)
 
                 # Фиксируем уведомление как отправленное
                 mark_item_as_notified(item_type, item_name, release_year)
