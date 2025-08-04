@@ -211,7 +211,7 @@ def get_jellyfin_image_and_upload_imgbb(photo_id):
         logging.warning(f"Ошибка скачивания из Jellyfin: {ex}")
         return None
 
-def send_discord_message(photo_id, message, title="Jellyfin"):
+def send_discord_message(photo_id, message, title="Jellyfin", uploaded_url=None):
     """
     Отправляет уведомление (текст и картинку) в Discord через Webhook.
     Картинка — из imgbb, как и для Gotify.
@@ -220,8 +220,8 @@ def send_discord_message(photo_id, message, title="Jellyfin"):
         logging.warning("DISCORD_WEBHOOK_URL not set, skipping Discord notification.")
         return None
 
-    # Получаем ссылку на картинку (imgbb)
-    uploaded_url = get_jellyfin_image_and_upload_imgbb(photo_id)
+    if uploaded_url is None:
+        uploaded_url = get_jellyfin_image_and_upload_imgbb(photo_id)
 
     data = {
         "username": title,
@@ -268,6 +268,7 @@ def clean_markdown_for_apprise(text):
     return text
 
 def send_notification(photo_id, caption):
+    uploaded_url = get_jellyfin_image_and_upload_imgbb(photo_id)
     """
     1. Всегда отправляет в Telegram напрямую (send_telegram_photo).
     2. Независимо — отправляет напрямую в Gotify (если включен).
@@ -280,7 +281,7 @@ def send_notification(photo_id, caption):
 #    gotify_message = clean_markdown_for_apprise(caption)
 #    gotify_response = None
     if GOTIFY_URL and GOTIFY_TOKEN:
-        gotify_response = send_gotify_message(photo_id, caption)
+        gotify_response = send_gotify_message(photo_id, caption, uploaded_url=uploaded_url)
         if gotify_response and gotify_response.ok:
             logging.info("Notification sent via Gotify")
         else:
@@ -288,7 +289,7 @@ def send_notification(photo_id, caption):
 
     # ======= ДОБАВЛЕНО ДЛЯ DISCORD =======
     if DISCORD_WEBHOOK_URL:
-        discord_response = send_discord_message(photo_id, caption)
+        discord_response = send_discord_message(photo_id, caption, uploaded_url=uploaded_url)
         if discord_response and discord_response.ok:
             logging.info("Notification sent via Discord")
         else:
@@ -357,7 +358,7 @@ def send_telegram_photo(photo_id, caption):
     response = requests.post(url, data=data, files=files)
     return response
 
-def send_gotify_message(photo_id, message, title="Jellyfin", priority=5 ):
+def send_gotify_message(photo_id, message, title="Jellyfin", priority=5, uploaded_url=None):
     """
     Отправка сообщения и картинки напрямую в Gotify.
     """
@@ -365,9 +366,10 @@ def send_gotify_message(photo_id, message, title="Jellyfin", priority=5 ):
         logging.warning("GOTIFY_URL or GOTIFY_TOKEN not set, skipping Gotify notification.")
         return None
 
-    uploaded_url = get_jellyfin_image_and_upload_imgbb(photo_id)
+    if uploaded_url is None:
+        uploaded_url = get_jellyfin_image_and_upload_imgbb(photo_id)
     if uploaded_url:
-        message = f"[![Poster]({uploaded_url})]({uploaded_url})\n\n{message}"
+        message = f"![Poster]({uploaded_url})\n\n{message}"
         big_image_url = uploaded_url
     else:
         big_image_url = None
