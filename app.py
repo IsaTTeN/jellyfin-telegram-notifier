@@ -279,25 +279,66 @@ def send_discord_message(photo_id, message, title="Jellyfin", uploaded_url=None)
         logging.warning(f"Error sending to Discord: {ex}")
         return None
 
-
 def clean_markdown_for_apprise(text):
     """
-    Упрощает markdown-подобные уведомления для plain text:
-    - убирает *жирный* и _курсив_
-    - превращает ссылки [название](url) в 'название: url'
-    - убирает двойные/одиночные пробелы у краёв строк
-    - оставляет эмодзи
+    Упрощает markdown-подобные уведомления для plain text и приводит ссылки к единому виду:
+    - [текст](url) -> url
+    - Убирает повторяющиеся подряд одинаковые url
+    - Добавляет префикс '🎥 <перевод new_trailer>:' перед каждой ссылкой (без дублирования)
+    - Очищает лишние пробелы по краям строк
     """
-    # Преобразовать [текст](ссылка) в 'текст: ссылка'
-    text = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'\1: \2', text)
+    if not text:
+        return text
+
+    # 0) Получаем локализованную метку для "Трейлер"
+    try:
+        trailer_label = t("new_trailer")
+    except Exception:
+        trailer_label = MESSAGES.get(LANG, {}).get("new_trailer", "Trailer")
+
+    # 1) [текст](url) -> url
+    text = re.sub(r'\[([^\]]+)\]\((https?://[^\s)]+)\)', r'\2', text)
+
+    # 2) Убираем подряд идущие повторы одного и того же URL
+    text = re.sub(r'(https?://\S+)(\s*\1)+', r'\1', text)
+
+    # 3) Сначала убираем уже проставленные префиксы, чтобы не получить дубликаты,
+    #    затем добавим их единообразно
+    prefix_pattern = rf'🎥\s*{re.escape(trailer_label)}[:]?\s*'
+    text = re.sub(rf'{prefix_pattern}(https?://\S+)', r'\1', text)
+
+    # 4) Добавляем "🎥 <label>:" перед каждой ссылкой
+    text = re.sub(r'(https?://\S+)', rf'🎥 {trailer_label}: \1', text)
+
+    # 5) Чистим лишние пробелы по краям строк (сохраняем переносы)
+    text = '\n'.join(line.strip() for line in text.split('\n'))
 
     # Убрать *жирный* и _курсив_
     text = re.sub(r'(\*|_){1,3}(.+?)\1{1,3}', r'\2', text)
 
-    # Убрать лишние пробелы по краям
-    text = '\n'.join([line.strip() for line in text.split('\n')])
+    return text
 
-    # При желании можно убрать любые другие "технические" символы
+def sanitize_whatsapp_text(text: str) -> str:
+    if not text:
+        return text
+
+    # Берём язык из переменной окружения
+    lang = os.environ.get("LANGUAGE", "en")
+    trailer_label = MESSAGES.get(lang, {}).get("new_trailer")
+
+    # 1) Превращаем [любой текст](https://...) в просто https://...
+    text = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'\2', text)
+
+    # 2) Убираем подряд идущие повторы одного и того же URL
+    text = re.sub(r'(https?://\S+)(\s*\1)+', r'\1', text)
+
+    # 3) Добавляем 🎥 <перевод new_trailer> перед ссылкой (если ещё нет)
+    pattern = rf'(?<!🎥 {re.escape(trailer_label)}\s)(https?://\S+)'
+    replacement = rf'🎥 {trailer_label} \1'
+    text = re.sub(pattern, replacement, text)
+
+    # 4) Чистим лишние пробелы
+    text = re.sub(r'[ \t]+', ' ', text).strip()
 
     return text
 
@@ -309,7 +350,7 @@ def send_notification(photo_id, caption):
     3. Остальные сервисы — через Apprise.
     """
     # Текст без Markdown (подходит для plain-транспорта, в т.ч. WhatsApp)
-    caption_plain = clean_markdown_for_apprise(caption)
+#    caption_plain = clean_markdown_for_apprise(caption)
     tg_response = send_telegram_photo(photo_id, caption)
 #    tg_GOTIFY = send_gotify_message(photo_id, caption)
 
@@ -519,7 +560,7 @@ def send_whatsapp_image_via_rest(
 
     form = {
         "phone": phone_jid,
-        "caption": caption or "",
+        "caption": sanitize_whatsapp_text(caption or ""),
         "view_once": str(bool(view_once)).lower(),
         "compress": str(bool(compress)).lower(),
         "duration": str(int(duration)),
@@ -632,7 +673,7 @@ def announce_new_releases_from_jellyfin():
 
                 notification_message = (
                     f"*{t('new_movie_title')}*\n\n*{movie_name_cleaned}* *({release_year})*\n\n{overview}\n\n"
-                    f"{t('new_runtime')}\n{runtime}")
+                    f"*{t('new_runtime')}*\n{runtime}")
 
                 if tmdb_id:
                     # приводим тип к тому, что ждёт MDblist: movie или series
