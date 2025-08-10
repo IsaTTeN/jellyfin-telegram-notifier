@@ -50,6 +50,12 @@ SEASON_ADDED_WITHIN_X_DAYS = int(os.environ["SEASON_ADDED_WITHIN_X_DAYS"])
 SIGNAL_URL = os.environ.get("SIGNAL_URL", "")
 SIGNAL_NUMBER = os.environ.get("SIGNAL_NUMBER", "")
 SIGNAL_RECIPIENTS = os.environ.get("SIGNAL_RECIPIENTS", "")
+WHATSAPP_API_URL = os.environ.get("WHATSAPP_API_URL", "").rstrip("/")
+WHATSAPP_NUMBER = os.environ.get("WHATSAPP_NUMBER", "")
+WHATSAPP_JID = os.environ.get("WHATSAPP_JID", "")
+WHATSAPP_GROUP_JID = os.environ.get("WHATSAPP_GROUP_JID", "")
+WHATSAPP_API_USERNAME = os.environ.get("WHATSAPP_API_USERNAME", "")
+WHATSAPP_API_PWD = os.environ.get("WHATSAPP_API_PWD", "")
 
 #выключить логику пропуска по датам
 #DEBUG_DISABLE_DATE_CHECKS = True
@@ -126,6 +132,30 @@ def t(key: str) -> str:
     Если ключ отсутствует — падает KeyError, чтобы вы не пропустили необходимость перевода.
     """
     return MESSAGES[LANG][key]
+
+def _wa_get_jid_from_env():
+    """
+    Возвращает JID из окружения.
+    Если задана группа — возвращаем группу.
+    Иначе личный чат из WHATSAPP_JID или WHATSAPP_NUMBER.
+    """
+    group_jid = WHATSAPP_GROUP_JID.strip()
+    if group_jid:
+        if not group_jid.endswith("@g.us"):
+            # допустим, передали только id без @g.us
+            group_jid = re.sub(r"[^\w\-]", "", group_jid) + "@g.us"
+        return group_jid
+
+    # Личный
+    raw = (WHATSAPP_JID or WHATSAPP_NUMBER).strip()
+    if not raw:
+        return None
+    if raw.endswith("@s.whatsapp.net"):
+        return raw
+    # очищаем до цифр и добавляем домен
+    local = re.sub(r"\D", "", raw)
+    return f"{local}@s.whatsapp.net" if local else None
+
 
 def fetch_mdblist_ratings(content_type: str, tmdb_id: str) -> str:
     """
@@ -278,6 +308,8 @@ def send_notification(photo_id, caption):
     2. Независимо — отправляет напрямую в Gotify (если включен).
     3. Остальные сервисы — через Apprise.
     """
+    # Текст без Markdown (подходит для plain-транспорта, в т.ч. WhatsApp)
+    caption_plain = clean_markdown_for_apprise(caption)
     tg_response = send_telegram_photo(photo_id, caption)
 #    tg_GOTIFY = send_gotify_message(photo_id, caption)
 
@@ -314,6 +346,23 @@ def send_notification(photo_id, caption):
         else:
             logging.warning("Notification failed via Signal")
     # --------------------------
+    # ======= WHATSAPP: отправляем картинку с подписью =======
+    try:
+        wa_jid = _wa_get_jid_from_env()
+        if WHATSAPP_API_URL and wa_jid:
+            send_whatsapp_image_via_rest(
+                caption=caption,
+                phone_jid=wa_jid,
+                image_url=uploaded_url,   # используем одну и ту же ссылку, что и для Gotify/Discord
+                view_once=False,
+                compress=False,
+                duration=3600,
+                is_forwarded=False,
+            )
+        else:
+            logging.debug("WhatsApp disabled or no JID; skip image send.")
+    except Exception as wa_ex:
+        logging.warning(f"WhatsApp image send failed: {wa_ex}")
 
     other_services = [url for url in APPRISE_URLS.split() if url]  # убираем пустые строки
     if other_services:
@@ -443,6 +492,56 @@ def send_signal_message_with_image(photo_id, message, SIGNAL_NUMBER, SIGNAL_RECI
         return resp
     except Exception as ex:
         logging.warning(f"Error sending Signal image message: {ex}")
+        return None
+
+
+def send_whatsapp_image_via_rest(
+    caption: str,
+    phone_jid: str = None,
+    image_url: str = None,
+#    photo_id: str = None,   # теперь необязательный
+    view_once: bool = False,
+    compress: bool = False,
+    duration: int = 3600,
+    is_forwarded: bool = False,
+):
+    if not WHATSAPP_API_URL:
+        logging.warning("WHATSAPP_API_URL not set, skipping WhatsApp image.")
+        return None
+
+    phone_jid = phone_jid or _wa_get_jid_from_env()
+    if not phone_jid:
+        logging.warning("WhatsApp JID is empty, skip sending image.")
+        return None
+
+    url = f"{WHATSAPP_API_URL.rstrip('/')}/send/image"
+    auth = (WHATSAPP_API_USERNAME, WHATSAPP_API_PWD)
+
+    form = {
+        "phone": phone_jid,
+        "caption": caption or "",
+        "view_once": str(bool(view_once)).lower(),
+        "compress": str(bool(compress)).lower(),
+        "duration": str(int(duration)),
+        "is_forwarded": str(bool(is_forwarded)).lower(),
+    }
+
+    files = None
+    jellyfin_used = False
+
+    if image_url:
+        form["image_url"] = image_url
+    else:
+        logging.warning("WhatsApp image: image_url не задан, пропускаем отправку изображения.")
+        return None
+
+    try:
+        resp = requests.post(url, data=form, files=files, auth=auth, timeout=30)
+        resp.raise_for_status()
+        logging.info("WhatsApp image sent successfully")
+        return resp
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"Error sending WhatsApp image: {e}")
         return None
 
 
