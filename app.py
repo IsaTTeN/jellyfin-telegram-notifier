@@ -7,6 +7,8 @@ import requests
 import tempfile
 import re
 import base64
+import threading
+import time
 from requests.exceptions import HTTPError
 from flask import Flask, request
 from dotenv import load_dotenv
@@ -32,22 +34,22 @@ rotating_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %
 logging.getLogger().addHandler(rotating_handler)
 
 # Constants
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-GOTIFY_URL = os.environ.get("GOTIFY_URL", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+GOTIFY_URL = os.environ.get("GOTIFY_URL", "").rstrip("/")
 GOTIFY_TOKEN = os.environ.get("GOTIFY_TOKEN", "")
-JELLYFIN_BASE_URL = os.environ["JELLYFIN_BASE_URL"]
+JELLYFIN_BASE_URL = os.environ["JELLYFIN_BASE_URL"].rstrip("/")
 JELLYFIN_API_KEY = os.environ["JELLYFIN_API_KEY"]
-YOUTUBE_API_KEY = os.environ["YOUTUBE_API_KEY"]
-MDBLIST_API_KEY = os.environ["MDBLIST_API_KEY"]
-IMGBB_API_KEY = os.environ["IMGBB_API_KEY"]
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+MDBLIST_API_KEY = os.environ.get("MDBLIST_API_KEY", "")
+IMGBB_API_KEY = os.environ.get("IMGBB_API_KEY", "")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
-TMDB_API_KEY = os.environ["TMDB_API_KEY"]
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY")
 TMDB_SEARCH_URL = "https://api.themoviedb.org/3/search/tv"
 LANGUAGE = os.environ["LANGUAGE"]
 EPISODE_PREMIERED_WITHIN_X_DAYS = int(os.environ["EPISODE_PREMIERED_WITHIN_X_DAYS"])
 SEASON_ADDED_WITHIN_X_DAYS = int(os.environ["SEASON_ADDED_WITHIN_X_DAYS"])
-SIGNAL_URL = os.environ.get("SIGNAL_URL", "")
+SIGNAL_URL = os.environ.get("SIGNAL_URL", "").rstrip("/")
 SIGNAL_NUMBER = os.environ.get("SIGNAL_NUMBER", "")
 SIGNAL_RECIPIENTS = os.environ.get("SIGNAL_RECIPIENTS", "")
 WHATSAPP_API_URL = os.environ.get("WHATSAPP_API_URL", "").rstrip("/")
@@ -59,11 +61,12 @@ WHATSAPP_API_PWD = os.environ.get("WHATSAPP_API_PWD", "")
 
 #выключить логику пропуска по датам
 #DEBUG_DISABLE_DATE_CHECKS = True
-
+# Глобальные переменные
+imgbb_upload_done = threading.Event()   # Сигнал о завершении загрузки
+uploaded_image_url = None               # Здесь хранится ссылка после удачной загрузки
 # Gotify больше не добавляем в APPRISE_URLS вообще!
 APPRISE_OTHER_URLS = os.environ.get("APPRISE_OTHER_URLS", "")
 APPRISE_URLS = APPRISE_OTHER_URLS.strip()
-
 
 apobj = Apprise()
 for url in APPRISE_URLS.split():
@@ -214,36 +217,41 @@ def get_tmdb_id(series_name: str, release_year: int) -> str:
 
 def upload_image_to_imgbb(image_bytes):
     """
-    Загружает изображение на imgbb.com и возвращает прямую ссылку на изображение.
-    Делает до 3 попыток в случае ошибки.
+    Загружает изображение на imgbb.com (до 3 попыток) и устанавливает событие по завершении.
     """
+    global uploaded_image_url
+    uploaded_image_url = None
+    imgbb_upload_done.clear()  # Сброс события
+
     url = "https://api.imgbb.com/1/upload"
     payload = {
         "key": IMGBB_API_KEY,
         "image": base64.b64encode(image_bytes).decode('utf-8')
     }
 
-    for attempt in range(1, 4):  # до 3 попыток
+    for attempt in range(1, 4):
         try:
-            response = requests.post(url, data=payload, timeout=15)
+            logging.info(f"Попытка загрузки на imgbb #{attempt}")
+            response = requests.post(url, data=payload, timeout=20)
             response.raise_for_status()
             data = response.json()
-
-            if data.get("success") and "url" in data.get("data", {}):
-                img_url = data["data"]["url"]
-                logging.info(f"Изображение успешно загружено на imgbb (попытка {attempt}): {img_url}")
-                return img_url
-            else:
-                logging.warning(f"Ответ imgbb не содержит ссылки (попытка {attempt}): {data}")
-
+            uploaded_image_url = data['data']['url']
+            logging.info(f"Изображение успешно загружено на imgbb: {uploaded_image_url}")
+            break
         except Exception as ex:
             logging.warning(f"Ошибка загрузки на imgbb (попытка {attempt}): {ex}")
+            if attempt < 3:
+                time.sleep(2)  # Пауза между попытками
 
-        # если не получилось — ждем перед следующей попыткой
-        time.sleep(2)
+    imgbb_upload_done.set()  # Сигнал, что загрузка завершена (успешно или нет)
+    return uploaded_image_url
 
-    logging.error("Не удалось загрузить изображение на imgbb после 3 попыток")
-    return None
+def wait_for_imgbb_upload():
+    """
+    Блокирует выполнение до завершения загрузки изображения.
+    """
+    imgbb_upload_done.wait()
+    return uploaded_image_url
 
 
 def get_jellyfin_image_and_upload_imgbb(photo_id):
@@ -260,6 +268,10 @@ def get_jellyfin_image_and_upload_imgbb(photo_id):
         return None
 
 def send_discord_message(photo_id, message, title="Jellyfin", uploaded_url=None):
+    img_url = wait_for_imgbb_upload()
+    if not img_url:
+        logging.warning("Изображение не загружено — пропускаем отправку в Discord.")
+        return
     """
     Отправляет уведомление (текст и картинку) в Discord через Webhook.
     Картинка — из imgbb, как и для Gotify.
@@ -365,7 +377,12 @@ def send_notification(photo_id, caption):
     """
     # Текст без Markdown (подходит для plain-транспорта, в т.ч. WhatsApp)
 #    caption_plain = clean_markdown_for_apprise(caption)
-    tg_response = send_telegram_photo(photo_id, caption)
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        tg_response = send_telegram_photo(photo_id, caption)
+        if tg_response and tg_response.ok:
+            logging.info("Notification sent via Telegram")
+        else:
+            logging.warning("Notification failed via Telegram")
 #    tg_GOTIFY = send_gotify_message(photo_id, caption)
 
     # Gotify: только если параметры заданы
@@ -463,29 +480,39 @@ def send_notification(photo_id, caption):
     return tg_response
 
 def send_telegram_photo(photo_id, caption):
-    # Ограничиваем caption до 600 символов
-    if caption and len(caption) > 600:
-        caption = caption[:597] + "..."  # добавляем троеточие, если обрезаем
+    try:
+        # Ограничиваем caption до 1024 символов
+    #    if caption and len(caption) > 1024:
+    #        caption = caption[:1023] + "..."  # добавляем троеточие, если обрезаем
 
-    base_photo_url = f"{JELLYFIN_BASE_URL}/Items/{photo_id}/Images"
-    primary_photo_url = f"{base_photo_url}/Primary"
+        base_photo_url = f"{JELLYFIN_BASE_URL}/Items/{photo_id}/Images"
+        primary_photo_url = f"{base_photo_url}/Primary"
 
-    # Download the image from the jellyfin
-    image_response = requests.get(primary_photo_url)
+        # Download the image from the jellyfin
+        image_response = requests.get(primary_photo_url)
 
-    # Upload the image to the Telegram bot
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    data = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "caption": caption,
-        "parse_mode": "Markdown"
-    }
+        # Upload the image to the Telegram bot
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "caption": caption,
+            "parse_mode": "Markdown"
+        }
 
-    files = {'photo': ('photo.jpg', image_response.content, 'image/jpeg')}
-    response = requests.post(url, data=data, files=files)
-    return response
+        files = {'photo': ('photo.jpg', image_response.content, 'image/jpeg')}
+        response = requests.post(url, data=data, files=files)
+        logging.info("Telegram notification sent successfully")
+        return response
+
+    except Exception as ex:
+        logging.warning(f"Error sending to Telegram: {ex}")
+        return None
 
 def send_gotify_message(photo_id, message, title="Jellyfin", priority=5, uploaded_url=None):
+    img_url = wait_for_imgbb_upload()
+    if not img_url:
+        logging.warning("Изображение не загружено — пропускаем отправку в Gotify.")
+        return
     """
     Отправка сообщения и картинки напрямую в Gotify.
     """
@@ -564,6 +591,10 @@ def send_whatsapp_image_via_rest(
     duration: int = 3600,
     is_forwarded: bool = False,
 ):
+    img_url = wait_for_imgbb_upload()
+    if not img_url:
+        logging.warning("Изображение не загружено — пропускаем отправку в WhatsApp.")
+        return
     if not WHATSAPP_API_URL:
         logging.warning("WHATSAPP_API_URL not set, skipping WhatsApp image.")
         return None
@@ -708,8 +739,8 @@ def announce_new_releases_from_jellyfin():
                 send_notification(movie_id, notification_message)
                 mark_item_as_notified(item_type, item_name, release_year)
                 logging.info(f"(Movie) {movie_name} {release_year} "
-                             f"notification was sent to telegram.")
-                return "Movie notification was sent to telegram"
+                             f"notification was sent.")
+                return "Movie notification was sent"
 
         if item_type == "Season":
             if not item_already_notified(item_type, item_name, release_year):
@@ -750,14 +781,14 @@ def announce_new_releases_from_jellyfin():
                 if response.status_code == 200:
                     mark_item_as_notified(item_type, item_name, release_year)
                     logging.info(f"(Season) {series_name_cleaned} {season} "
-                                 f"notification was sent to telegram.")
-                    return "Season notification was sent to telegram"
+                                 f"notification was sent")
+                    return "Season notification was sent"
                 else:
                     send_notification(series_id, notification_message)
                     mark_item_as_notified(item_type, item_name, release_year)
                     logging.warning(f"{series_name_cleaned} {season} image does not exists, falling back to series image")
-                    logging.info(f"(Season) {series_name_cleaned} {season} notification was sent to telegram")
-                    return "Season notification was sent to telegram"
+                    logging.info(f"(Season) {series_name_cleaned} {season} notification was sent")
+                    return "Season notification was sent"
 
         if item_type == "Episode":
             if not item_already_notified(item_type, item_name, release_year):
@@ -790,15 +821,15 @@ def announce_new_releases_from_jellyfin():
 
                     if response.status_code == 200:
                         mark_item_as_notified(item_type, item_name, release_year)
-                        logging.info(f"(Episode) {series_name} S{season_num}E{season_epi} notification sent to Telegram!")
-                        return "Notification sent to Telegram!"
+                        logging.info(f"(Episode) {series_name} S{season_num}E{season_epi} notification sent!")
+                        return "Notification sent!"
                     else:
                         send_notification(series_id, notification_message)
                         logging.warning(f"(Episode) {series_name} season image does not exists, "
                                         f"falling back to series image")
                         mark_item_as_notified(item_type, item_name, release_year)
-                        logging.info(f"(Episode) {series_name} S{season_num}E{season_epi} notification sent to Telegram!")
-                        return "Notification sent to Telegram!"
+                        logging.info(f"(Episode) {series_name} S{season_num}E{season_epi} notification sent!")
+                        return "Notification sent!"
 
                 else:
                     logging.info(f"(Episode) {series_name} S{season_num}E{season_epi} "
