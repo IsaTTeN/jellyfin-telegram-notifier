@@ -1,6 +1,6 @@
 import logging
 from logging.handlers import TimedRotatingFileHandler
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 import os
 import json
 import requests
@@ -215,22 +215,36 @@ def get_tmdb_id(series_name: str, release_year: int) -> str:
 def upload_image_to_imgbb(image_bytes):
     """
     Загружает изображение на imgbb.com и возвращает прямую ссылку на изображение.
+    Делает до 3 попыток в случае ошибки.
     """
     url = "https://api.imgbb.com/1/upload"
     payload = {
         "key": IMGBB_API_KEY,
         "image": base64.b64encode(image_bytes).decode('utf-8')
     }
-    try:
-        response = requests.post(url, data=payload)
-        response.raise_for_status()
-        data = response.json()
-        img_url = data['data']['url']
-        logging.info(f"Изображение успешно загружено на imgbb: {img_url}")
-        return img_url
-    except Exception as ex:
-        logging.warning(f"Ошибка загрузки на imgbb: {ex}")
-        return None
+
+    for attempt in range(1, 4):  # до 3 попыток
+        try:
+            response = requests.post(url, data=payload, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+
+            if data.get("success") and "url" in data.get("data", {}):
+                img_url = data["data"]["url"]
+                logging.info(f"Изображение успешно загружено на imgbb (попытка {attempt}): {img_url}")
+                return img_url
+            else:
+                logging.warning(f"Ответ imgbb не содержит ссылки (попытка {attempt}): {data}")
+
+        except Exception as ex:
+            logging.warning(f"Ошибка загрузки на imgbb (попытка {attempt}): {ex}")
+
+        # если не получилось — ждем перед следующей попыткой
+        time.sleep(2)
+
+    logging.error("Не удалось загрузить изображение на imgbb после 3 попыток")
+    return None
+
 
 def get_jellyfin_image_and_upload_imgbb(photo_id):
     """
