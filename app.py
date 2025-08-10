@@ -47,6 +47,10 @@ TMDB_SEARCH_URL = "https://api.themoviedb.org/3/search/tv"
 LANGUAGE = os.environ["LANGUAGE"]
 EPISODE_PREMIERED_WITHIN_X_DAYS = int(os.environ["EPISODE_PREMIERED_WITHIN_X_DAYS"])
 SEASON_ADDED_WITHIN_X_DAYS = int(os.environ["SEASON_ADDED_WITHIN_X_DAYS"])
+SIGNAL_URL = os.environ.get("SIGNAL_URL", "")
+SIGNAL_NUMBER = os.environ.get("SIGNAL_NUMBER", "")
+SIGNAL_RECIPIENTS = os.environ.get("SIGNAL_RECIPIENTS", "")
+
 #выключить логику пропуска по датам
 #DEBUG_DISABLE_DATE_CHECKS = True
 
@@ -296,6 +300,21 @@ def send_notification(photo_id, caption):
             logging.warning("Notification failed via Discord")
     # =====================================
 
+    # --- ОТПРАВКА В SIGNAL ---
+    # Plain text для Signal (без Markdown)
+    if SIGNAL_URL and SIGNAL_NUMBER:
+        signal_resp = send_signal_message_with_image(
+            photo_id,
+            clean_markdown_for_apprise(caption),
+            SIGNAL_NUMBER,
+            SIGNAL_RECIPIENTS
+        )
+        if signal_resp and signal_resp.ok:
+            logging.info("Notification sent via Signal")
+        else:
+            logging.warning("Notification failed via Signal")
+    # --------------------------
+
     other_services = [url for url in APPRISE_URLS.split() if url]  # убираем пустые строки
     if other_services:
         apprise_obj = Apprise()
@@ -397,6 +416,35 @@ def send_gotify_message(photo_id, message, title="Jellyfin", priority=5, uploade
     except Exception as ex:
         logging.warning(f"Error sending to Gotify: {ex}")
         return None
+
+def send_signal_message_with_image(photo_id, message, SIGNAL_NUMBER, SIGNAL_RECIPIENTS, api_url=SIGNAL_URL):
+    """
+    Отправляет текст и изображение из Jellyfin в Signal через base64_attachments.
+    """
+    # Скачиваем изображение из Jellyfin
+    jellyfin_image_url = f"{JELLYFIN_BASE_URL}/Items/{photo_id}/Images/Primary"
+    try:
+        image_resp = requests.get(jellyfin_image_url)
+        image_resp.raise_for_status()
+        image_bytes = image_resp.content
+        # Кодируем в base64
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        data = {
+            "message": message,
+            "number": SIGNAL_NUMBER,
+            "recipients": SIGNAL_RECIPIENTS if isinstance(SIGNAL_RECIPIENTS, list) else [SIGNAL_RECIPIENTS],
+            "base64_attachments": [image_b64],
+        }
+
+        resp = requests.post(api_url, json=data)
+        resp.raise_for_status()
+        logging.info("Signal image message sent successfully")
+        return resp
+    except Exception as ex:
+        logging.warning(f"Error sending Signal image message: {ex}")
+        return None
+
 
 def get_item_details(item_id):
     headers = {'accept': 'application/json', }
