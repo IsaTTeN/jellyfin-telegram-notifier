@@ -477,7 +477,7 @@ def send_notification(photo_id, caption):
         logging.info("Notification sent via Apprise")
     else:
         logging.warning("Notification failed via Apprise")
-    return tg_response
+    return None
 
 def send_telegram_photo(photo_id, caption):
     try:
@@ -853,11 +853,11 @@ def announce_new_releases_from_jellyfin():
 
                 # Шаблон уведомления
                 notification_message = (
-                    "*{t('new_album_title')}*\n\n"
+                    f"*{t('new_album_title')}*\n\n"
                     f"*{artist}*\n\n"
                     f"*{album_name} ({year})*\n\n"
                     f"{overview and overview + '\n\n' or ''}"
-                    f"{t('new_runtime')}\n{runtime}\n\n"
+                    f"*{t('new_runtime')}*\n{runtime}\n\n"
                     f"{f'[MusicBrainz]({mb_link})' if mb_link else ''}\n"
                 )
 
