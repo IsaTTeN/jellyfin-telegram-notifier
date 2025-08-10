@@ -449,6 +449,10 @@ def send_notification(photo_id, caption):
     return tg_response
 
 def send_telegram_photo(photo_id, caption):
+    # Ограничиваем caption до 600 символов
+    if caption and len(caption) > 600:
+        caption = caption[:597] + "..."  # добавляем троеточие, если обрезаем
+
     base_photo_url = f"{JELLYFIN_BASE_URL}/Items/{photo_id}/Images"
     primary_photo_url = f"{base_photo_url}/Primary"
 
