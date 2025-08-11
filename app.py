@@ -59,10 +59,9 @@ WHATSAPP_JID = os.environ.get("WHATSAPP_JID", "")
 WHATSAPP_GROUP_JID = os.environ.get("WHATSAPP_GROUP_JID", "")
 WHATSAPP_API_USERNAME = os.environ.get("WHATSAPP_API_USERNAME", "")
 WHATSAPP_API_PWD = os.environ.get("WHATSAPP_API_PWD", "")
-MATRIX_URL = "https://matrix.org"
-MATRIX_ACCESS_TOKEN = "mct_nsQJPx6qaHh99SnlH8UqPwF1UVmm1O_XF2iI2"
-MATRIX_ROOM_ID = "!yLWcSmTDVBQsaBtnor:matrix.org"
-#MATRIX_USER_ID = "@druidblack:matrix.org"
+MATRIX_URL = os.environ.get("MATRIX_URL", "")
+MATRIX_ACCESS_TOKEN = os.environ.get("MATRIX_ACCESS_TOKEN", "")
+MATRIX_ROOM_ID = os.environ.get("MATRIX_ROOM_ID", "")
 #выключить логику пропуска по датам
 #DEBUG_DISABLE_DATE_CHECKS = True
 # Глобальные переменные
