@@ -495,6 +495,29 @@ def send_notification(photo_id, caption):
     else:
         logging.warning("Notification failed via Apprise")
     return None
+def _fetch_jellyfin_image_with_retries(photo_id: str, attempts: int = 3, timeout: int = 10, delay: float = 1.5):
+    """
+    Пытается скачать Primary-постер из Jellyfin с повторами.
+    Возвращает bytes или None.
+    """
+    url = f"{JELLYFIN_BASE_URL}/Items/{photo_id}/Images/Primary"
+    last_err = None
+    for i in range(1, attempts + 1):
+        try:
+            # Быстрая проверка доступности (необязательно, но полезно)
+            head = requests.head(url, timeout=timeout)
+            if head.ok:
+                resp = requests.get(url, timeout=timeout)
+                resp.raise_for_status()
+                return resp.content
+            else:
+                last_err = f"HTTP {head.status_code}"
+        except Exception as ex:
+            last_err = ex
+        logging.warning(f"Jellyfin image try {i}/{attempts} failed: {last_err}")
+        if i < attempts:
+            time.sleep(delay)
+    return None
 
 def send_telegram_photo(photo_id, caption):
     try:
@@ -502,11 +525,17 @@ def send_telegram_photo(photo_id, caption):
     #    if caption and len(caption) > 1024:
     #        caption = caption[:1023] + "..."  # добавляем троеточие, если обрезаем
 
-        base_photo_url = f"{JELLYFIN_BASE_URL}/Items/{photo_id}/Images"
-        primary_photo_url = f"{base_photo_url}/Primary"
+#        base_photo_url = f"{JELLYFIN_BASE_URL}/Items/{photo_id}/Images"
+#        primary_photo_url = f"{base_photo_url}/Primary"
 
         # Download the image from the jellyfin
-        image_response = requests.get(primary_photo_url)
+#        image_response = requests.get(primary_photo_url)
+
+        # Пытаемся получить картинку с повторами
+        image_bytes = _fetch_jellyfin_image_with_retries(photo_id, attempts=3, timeout=10, delay=1.5)
+        if not image_bytes:
+            logging.warning("Telegram: Jellyfin image unavailable after retries")
+            return None
 
         # Upload the image to the Telegram bot
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
@@ -516,8 +545,8 @@ def send_telegram_photo(photo_id, caption):
             "parse_mode": "Markdown"
         }
 
-        files = {'photo': ('photo.jpg', image_response.content, 'image/jpeg')}
-        response = requests.post(url, data=data, files=files)
+        files = {'photo': ('photo.jpg', image_bytes, 'image/jpeg')}
+        response = requests.post(url, data=data, files=files, timeout=30)
         logging.info("Telegram notification sent successfully")
         return response
 
