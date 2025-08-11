@@ -1,6 +1,6 @@
 import logging
 from logging.handlers import TimedRotatingFileHandler
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta #, time
 import os
 import json
 import requests
@@ -13,6 +13,7 @@ from requests.exceptions import HTTPError
 from flask import Flask, request
 from dotenv import load_dotenv
 from apprise import Apprise
+from urllib.parse import quote
 
 load_dotenv()
 app = Flask(__name__)
@@ -58,7 +59,10 @@ WHATSAPP_JID = os.environ.get("WHATSAPP_JID", "")
 WHATSAPP_GROUP_JID = os.environ.get("WHATSAPP_GROUP_JID", "")
 WHATSAPP_API_USERNAME = os.environ.get("WHATSAPP_API_USERNAME", "")
 WHATSAPP_API_PWD = os.environ.get("WHATSAPP_API_PWD", "")
-
+MATRIX_URL = "https://matrix.org"
+MATRIX_ACCESS_TOKEN = "mct_nsQJPx6qaHh99SnlH8UqPwF1UVmm1O_XF2iI2"
+MATRIX_ROOM_ID = "!yLWcSmTDVBQsaBtnor:matrix.org"
+#MATRIX_USER_ID = "@druidblack:matrix.org"
 #выключить логику пропуска по датам
 #DEBUG_DISABLE_DATE_CHECKS = True
 # Глобальные переменные
@@ -403,7 +407,20 @@ def send_notification(photo_id, caption):
         else:
             logging.warning("Notification failed via Discord")
     # =====================================
-
+    # ======= MATRIX (REST): СНАЧАЛА изображение из Jellyfin, затем текст =======
+    try:
+        if MATRIX_URL and MATRIX_ACCESS_TOKEN and MATRIX_ROOM_ID:
+            ok = send_matrix_image_then_text_from_jellyfin(photo_id, caption)
+            if ok:
+                logging.info("Notification sent via Matrix (REST, image from Jellyfin then text)")
+            else:
+                logging.warning("Matrix (REST, Jellyfin): image+text flow failed; trying text-only fallback")
+                send_matrix_text_rest(caption)
+        else:
+            logging.debug("Matrix disabled or not configured; skip.")
+    except Exception as m_ex:
+        logging.warning(f"Matrix send failed: {m_ex}")
+    # ========================================================================
     # --- ОТПРАВКА В SIGNAL ---
     # Plain text для Signal (без Markdown)
     if SIGNAL_URL and SIGNAL_NUMBER:
@@ -507,6 +524,278 @@ def send_telegram_photo(photo_id, caption):
     except Exception as ex:
         logging.warning(f"Error sending to Telegram: {ex}")
         return None
+
+def send_matrix_text_rest(message_markdown: str):
+    """
+    Отправляет ТОЛЬКО текст в Matrix через REST (v3).
+    1) Пытается правильный PUT по спецификации.
+    2) Если прокси блокирует PUT (405) — делает POST фоллбэк на тот же путь.
+    Возвращает объект response при успехе, иначе None.
+    """
+    if not (MATRIX_URL and MATRIX_ACCESS_TOKEN and MATRIX_ROOM_ID):
+        logging.debug("Matrix not configured; skip.")
+        return None
+
+    try:
+        # room_id вида "!MNddurK...:example.org" нужно URL-энкодить полностью
+        room_enc = quote(MATRIX_ROOM_ID, safe="")
+        base = f"{MATRIX_URL.rstrip('/')}/_matrix/client/v3/rooms/{room_enc}/send/m.room.message"
+
+        headers = {
+            "Authorization": f"Bearer {MATRIX_ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+        }
+
+        # Чистим Markdown для plain-текста (Matrix клиенты корректно покажут)
+        body_plain = clean_markdown_for_apprise(message_markdown) or ""
+        payload = {"msgtype": "m.text", "body": body_plain}
+
+        # Уникальный txnId (в миллисекундах)
+        txn_id = f"{int(time.time() * 1000)}txt"
+        url = f"{base}/{txn_id}"
+
+        # 1) Правильный путь: PUT (спецификация)
+        try:
+            resp = requests.put(url, headers=headers, json=payload, timeout=30)
+            resp.raise_for_status()
+            logging.info("Matrix text sent successfully via PUT v3")
+            return resp
+        except requests.exceptions.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            if status == 405:
+                # 2) Фоллбэк: POST тем же урлом (некоторые reverse-proxy режут PUT)
+                logging.warning("Matrix PUT blocked (405). Trying POST fallback…")
+                resp2 = requests.post(url, headers=headers, json=payload, timeout=30)
+                resp2.raise_for_status()
+                logging.info("Matrix text sent successfully via POST fallback")
+                return resp2
+            else:
+                logging.warning(f"Matrix text send failed via PUT: {e}")
+                return None
+
+    except Exception as ex:
+        logging.warning(f"Matrix text send failed: {ex}")
+        return None
+
+def matrix_upload_image_rest(image_bytes: bytes, filename: str, mimetype: str = "image/jpeg") -> str | None:
+    """
+    Загружает картинку в Matrix content repo и возвращает mxc:// URI.
+    Пробуем v3, при 404/405/501 — фоллбэк на r0.
+    """
+    if not (MATRIX_URL and MATRIX_ACCESS_TOKEN):
+        logging.debug("Matrix not configured for media upload; skip.")
+        return None
+
+    headers = {"Authorization": f"Bearer {MATRIX_ACCESS_TOKEN}", "Content-Type": mimetype}
+    base = MATRIX_URL.rstrip("/")
+    url_v3 = f"{base}/_matrix/media/v3/upload?filename={quote(filename)}"
+
+    try:
+        r = requests.post(url_v3, headers=headers, data=image_bytes, timeout=30)
+        r.raise_for_status()
+        return r.json().get("content_uri")
+    except requests.exceptions.HTTPError as e:
+        code = getattr(e.response, "status_code", None)
+        if code in (404, 405, 501):
+            logging.warning(f"media/v3/upload returned {code}, trying r0…")
+            try:
+                url_r0 = f"{base}/_matrix/media/r0/upload?filename={quote(filename)}"
+                r2 = requests.post(url_r0, headers=headers, data=image_bytes, timeout=30)
+                r2.raise_for_status()
+                return r2.json().get("content_uri")
+            except Exception as ex2:
+                logging.warning(f"Matrix r0 upload failed: {ex2}")
+                return None
+        logging.warning(f"Matrix v3 upload failed: {e}")
+        return None
+    except Exception as ex:
+        logging.warning(f"Matrix upload failed: {ex}")
+        return None
+
+
+def _matrix_send_event_rest(room_id: str, event_type: str, content: dict):
+    """
+    Отправляет событие в комнату:
+      PUT /_matrix/client/v3/rooms/{roomId}/send/{eventType}/{txnId}
+    При 405 — POST на тот же путь.
+    Возвращает response или None.
+    """
+    if not (MATRIX_URL and MATRIX_ACCESS_TOKEN and room_id):
+        return None
+
+    room_enc = quote(room_id, safe="")
+    base = f"{MATRIX_URL.rstrip('/')}/_matrix/client/v3/rooms/{room_enc}/send/{event_type}"
+    txn_id = f"{int(time.time()*1000)}evt"
+    url = f"{base}/{txn_id}"
+    headers = {"Authorization": f"Bearer {MATRIX_ACCESS_TOKEN}", "Content-Type": "application/json"}
+
+    try:
+        resp = requests.put(url, headers=headers, json=content, timeout=30)
+        resp.raise_for_status()
+        return resp
+    except requests.exceptions.HTTPError as e:
+        if getattr(e.response, "status_code", None) == 405:
+            logging.warning("PUT blocked (405). Trying POST fallback…")
+            try:
+                resp2 = requests.post(url, headers=headers, json=content, timeout=30)
+                resp2.raise_for_status()
+                return resp2
+            except Exception as ex2:
+                logging.warning(f"Matrix POST fallback failed: {ex2}")
+                return None
+        logging.warning(f"Matrix send event failed via PUT: {e}")
+        return None
+    except Exception as ex:
+        logging.warning(f"Matrix send event failed: {ex}")
+        return None
+
+
+#def send_matrix_image_from_imgbb(photo_id: str, caption_markdown: str, uploaded_url: str | None = None):
+#    """
+#    Отправляет В MATRIX изображение, которое было загружено на imgbb:
+#      1) ждём готовности imgbb (если uploaded_url не передан) -> берём HTTP-URL
+#      2) скачиваем картинку с imgbb
+#      3) загружаем в Matrix media-repo (получаем mxc://…)
+#      4) отправляем m.image с подписью в body
+#    Возвращает response или None.
+#    """
+#    # 1) Берём URL из imgbb
+#    try:
+#        img_http_url = uploaded_url or wait_for_imgbb_upload()
+#        if not img_http_url:
+#            logging.warning("Matrix image: imgbb URL is empty; skip.")
+#            return None
+#    except Exception as ex:
+#        logging.warning(f"Matrix image: waiting imgbb failed: {ex}")
+#        return None
+
+    # 2) Скачиваем картинку с imgbb
+#    try:
+#        r = requests.get(img_http_url, timeout=30)
+#        r.raise_for_status()
+#        image_bytes = r.content
+#        mimetype = r.headers.get("Content-Type", "image/jpeg").split(";")[0].strip().lower()
+#        ext = ".jpg"
+#        if "png" in mimetype: ext = ".png"
+#        elif "webp" in mimetype: ext = ".webp"
+#        filename = f"poster{ext}"
+#    except Exception as ex:
+#        logging.warning(f"Matrix image: cannot download from imgbb: {ex}")
+#        return None
+
+    # 3) Загружаем в Matrix → получаем mxc://
+#    mxc = matrix_upload_image_rest(image_bytes, filename, mimetype)
+#    if not mxc:
+#        return None
+
+    # 👇 ВАЖНО: body = ИМЯ ФАЙЛА, НЕ caption
+#   content = {
+#        "msgtype": "m.image",
+#        "body": filename,     # <-- раньше здесь был caption; поменяли на имя файла
+#        "url": mxc,
+#        "info": {
+#            "mimetype": mimetype,
+#            "size": len(image_bytes),
+#        },
+#    }
+#    return _matrix_send_event_rest(MATRIX_ROOM_ID, "m.room.message", content)
+
+
+#def send_matrix_image_then_text_from_imgbb(photo_id: str, caption_markdown: str, uploaded_url: str | None = None) -> bool:
+    """
+    Сначала отправляет в Matrix изображение (берём именно то, что лежит на imgbb),
+    затем отдельным сообщением отправляет текст (используем send_matrix_text_rest).
+    """
+#    img_ok = False
+#    try:
+#        r_img = send_matrix_image_from_imgbb(photo_id, caption_markdown, uploaded_url=uploaded_url)
+#        if r_img and r_img.ok:
+#            img_ok = True
+#            logging.info("Matrix: image (from imgbb) sent successfully.")
+#        else:
+#            logging.warning("Matrix: image (from imgbb) failed to send.")
+#    except Exception as ex:
+#        logging.warning(f"Matrix: image-from-imgbb pipeline failed: {ex}")
+
+#    txt_ok = False
+#    try:
+#        r_txt = send_matrix_text_rest(caption_markdown)
+#        if r_txt and r_txt.ok:
+#            txt_ok = True
+#            logging.info("Matrix: text sent successfully after image.")
+#        else:
+#            logging.warning("Matrix: text failed to send after image.")
+#    except Exception as ex:
+#       logging.warning(f"Matrix: text pipeline failed: {ex}")
+
+#    return img_ok and txt_ok
+
+def _fetch_jellyfin_primary(photo_id: str):
+    """
+    Возвращает (bytes, mimetype, filename) для Primary-постера из Jellyfin.
+    """
+    url = f"{JELLYFIN_BASE_URL}/Items/{photo_id}/Images/Primary"
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    mimetype = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip().lower()
+    ext = ".jpg"
+    if "png" in mimetype:
+        ext = ".png"
+    elif "webp" in mimetype:
+        ext = ".webp"
+    filename = f"poster{ext}"
+    return resp.content, mimetype, filename
+
+
+def send_matrix_image_then_text_from_jellyfin(photo_id: str, caption_markdown: str) -> bool:
+    """
+    1) Тянем постер из Jellyfin
+    2) Загружаем в Matrix (media repo) -> mxc://
+    3) Отправляем m.image (body = имя файла)
+    4) Отдельным сообщением отправляем текст (m.text)
+    """
+    if not (MATRIX_URL and MATRIX_ACCESS_TOKEN and MATRIX_ROOM_ID):
+        logging.debug("Matrix not configured; skip.")
+        return False
+
+    # 1) картинка из Jellyfin
+    try:
+        img_bytes, mimetype, filename = _fetch_jellyfin_primary(photo_id)
+    except Exception as ex:
+        logging.warning(f"Matrix(JF): cannot fetch image from Jellyfin: {ex}")
+        # хотя бы текст отправим
+        resp_txt = send_matrix_text_rest(caption_markdown)
+        return bool(resp_txt and resp_txt.ok)
+
+    # 2) upload -> mxc://
+    mxc_uri = matrix_upload_image_rest(img_bytes, filename, mimetype)
+    if not mxc_uri:
+        logging.warning("Matrix(JF): media upload failed; sending text only.")
+        resp_txt = send_matrix_text_rest(caption_markdown)
+        return bool(resp_txt and resp_txt.ok)
+
+    # 3) m.image (ВАЖНО: body — имя файла)
+    content_img = {
+        "msgtype": "m.image",
+        "body": filename,
+        "url": mxc_uri,
+        "info": {
+            "mimetype": mimetype,
+            "size": len(img_bytes),
+        },
+    }
+    resp_img = _matrix_send_event_rest(MATRIX_ROOM_ID, "m.room.message", content_img)
+    img_ok = bool(resp_img and resp_img.ok)
+
+    # 4) затем текст отдельным сообщением
+    resp_txt = send_matrix_text_rest(caption_markdown)
+    txt_ok = bool(resp_txt and resp_txt.ok)
+
+    if img_ok and txt_ok:
+        logging.info("Matrix(JF): image then text sent successfully.")
+    else:
+        logging.warning("Matrix(JF): image+text flow partially/fully failed.")
+    return img_ok and txt_ok
 
 def send_gotify_message(photo_id, message, title="Jellyfin", priority=5, uploaded_url=None):
     img_url = wait_for_imgbb_upload()
