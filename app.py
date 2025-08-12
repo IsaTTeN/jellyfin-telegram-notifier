@@ -59,7 +59,7 @@ WHATSAPP_JID = os.environ.get("WHATSAPP_JID", "")
 WHATSAPP_GROUP_JID = os.environ.get("WHATSAPP_GROUP_JID", "")
 WHATSAPP_API_USERNAME = os.environ.get("WHATSAPP_API_USERNAME", "")
 WHATSAPP_API_PWD = os.environ.get("WHATSAPP_API_PWD", "")
-MATRIX_URL = os.environ.get("MATRIX_URL", "")
+MATRIX_URL = os.environ.get("MATRIX_URL", "").rstrip("/")
 MATRIX_ACCESS_TOKEN = os.environ.get("MATRIX_ACCESS_TOKEN", "")
 MATRIX_ROOM_ID = os.environ.get("MATRIX_ROOM_ID", "")
 #выключить логику пропуска по датам
@@ -438,14 +438,11 @@ def send_notification(photo_id, caption):
     try:
         wa_jid = _wa_get_jid_from_env()
         if WHATSAPP_API_URL and wa_jid:
+            # view_once, compress, duration, is_forwarded возьмутся из дефолтов
             send_whatsapp_image_via_rest(
                 caption=caption,
                 phone_jid=wa_jid,
-                image_url=uploaded_url,   # используем одну и ту же ссылку, что и для Gotify/Discord
-                view_once=False,
-                compress=False,
-                duration=3600,
-                is_forwarded=False,
+                image_url=uploaded_url
             )
         else:
             logging.debug("WhatsApp disabled or no JID; skip image send.")
@@ -730,10 +727,10 @@ def _matrix_send_event_rest(room_id: str, event_type: str, content: dict):
 
 
 #def send_matrix_image_then_text_from_imgbb(photo_id: str, caption_markdown: str, uploaded_url: str | None = None) -> bool:
-    """
-    Сначала отправляет в Matrix изображение (берём именно то, что лежит на imgbb),
-    затем отдельным сообщением отправляет текст (используем send_matrix_text_rest).
-    """
+#    """
+#    Сначала отправляет в Matrix изображение (берём именно то, что лежит на imgbb),
+#    затем отдельным сообщением отправляет текст (используем send_matrix_text_rest).
+#    """
 #    img_ok = False
 #    try:
 #        r_img = send_matrix_image_from_imgbb(photo_id, caption_markdown, uploaded_url=uploaded_url)
@@ -905,7 +902,7 @@ def send_whatsapp_image_via_rest(
 #    photo_id: str = None,   # теперь необязательный
     view_once: bool = False,
     compress: bool = False,
-    duration: int = 3600,
+    duration: int = 0,
     is_forwarded: bool = False,
 ):
     img_url = wait_for_imgbb_upload()
