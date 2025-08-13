@@ -14,6 +14,10 @@ from flask import Flask, request
 from dotenv import load_dotenv
 from apprise import Apprise
 from urllib.parse import quote
+import smtplib
+from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
+import markdown  # Markdown -> HTML
 
 load_dotenv()
 app = Flask(__name__)
@@ -62,6 +66,15 @@ WHATSAPP_API_PWD = os.environ.get("WHATSAPP_API_PWD", "")
 MATRIX_URL = os.environ.get("MATRIX_URL", "").rstrip("/")
 MATRIX_ACCESS_TOKEN = os.environ.get("MATRIX_ACCESS_TOKEN", "")
 MATRIX_ROOM_ID = os.environ.get("MATRIX_ROOM_ID", "")
+SMTP_SUBJECT = "Новый релиз в Jellyfin"
+SMTP_HOST = os.environ.get("SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASS = os.environ.get("SMTP_PASS", "")
+SMTP_FROM = os.environ.get("SMTP_FROM", "")
+SMTP_TO   = os.environ.get("SMTP_TO", "")  # список через запятую/пробел
+SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "1") not in ("0", "", "false", "False")   # для STARTTLS (587)
+SMTP_USE_SSL = os.environ.get("SMTP_USE_SSL", "0") in ("1", "true", "True")   # для SMTPS (465); если 1, то TLS не используем
 #выключить логику пропуска по датам
 #DEBUG_DISABLE_DATE_CHECKS = True
 # Глобальные переменные
@@ -371,6 +384,89 @@ def sanitize_whatsapp_text(text: str) -> str:
 
     return text
 
+def send_email_with_image_jellyfin(photo_id: str, subject: str, body_markdown: str):
+    """
+    Отправляет email с:
+      - text/plain (plain-версия текста)
+      - text/html (Markdown → HTML)
+      - inline-изображением из Jellyfin (через CID)
+    Возвращает True/False.
+    """
+    if not (SMTP_HOST and SMTP_FROM and SMTP_TO):
+        logging.debug("Email disabled or misconfigured; skip.")
+        return False
+
+    # plain-версия (без форматирования) — используем ваш очиститель
+    body_plain = clean_markdown_for_apprise(body_markdown or "")
+
+    # HTML-версия — рендерим из Markdown
+    # extensions для более приятных списков/переносов
+    body_html_rendered = markdown.markdown(
+        body_markdown or "",
+        extensions=["extra", "sane_lists", "nl2br"]
+    )
+
+    # Тянем картинку из Jellyfin (с повторами)
+    img_bytes = None
+    img_subtype = "jpeg"
+    try:
+        img_bytes = _fetch_jellyfin_image_with_retries(photo_id, attempts=3, timeout=10, delay=1.5)
+        # subtype подберём осторожно (если есть headers в ретрае — можно хранить вместе)
+        # здесь предполагаем jpeg; при желании можно расширить определение
+    except Exception as ex:
+        logging.warning(f"Email: failed to fetch Jellyfin image: {ex}")
+
+    msg = EmailMessage()
+    msg["Subject"] = subject or SMTP_SUBJECT
+    msg["From"]    = SMTP_FROM
+    recipients = [x.strip() for x in re.split(r"[,\s]+", SMTP_TO) if x.strip()]
+    msg["To"]     = ", ".join(recipients)
+    msg["Date"]   = formatdate(localtime=True)
+
+    # 1) text/plain
+    msg.set_content(body_plain or "")
+
+    # 2) text/html (+ inline image при наличии)
+    if img_bytes:
+        cid = make_msgid()  # вида <...@domain>
+        html_part = f"""\
+<html>
+  <body>
+    <div>{body_html_rendered}</div>
+    <p><img src="cid:{cid[1:-1]}" alt="poster"></p>
+  </body>
+</html>"""
+        msg.add_alternative(html_part, subtype="html")
+        try:
+            # прикрепляем картинку к HTML-части как related
+            msg.get_payload()[1].add_related(img_bytes, maintype="image", subtype=img_subtype, cid=cid)
+        except Exception as ex:
+            logging.warning(f"Email: cannot embed inline image (fallback as attachment): {ex}")
+            msg.add_attachment(img_bytes, maintype="image", subtype=img_subtype, filename="poster.jpg")
+    else:
+        # нет картинки — просто HTML без тега <img>
+        msg.add_alternative(f"<html><body>{body_html_rendered}</body></html>", subtype="html")
+
+    # Отправка
+    try:
+        if SMTP_USE_SSL or SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+                if SMTP_USER:
+                    s.login(SMTP_USER, SMTP_PASS)
+                s.send_message(msg)
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+                if SMTP_USE_TLS:
+                    s.starttls()
+                if SMTP_USER:
+                    s.login(SMTP_USER, SMTP_PASS)
+                s.send_message(msg)
+        logging.info("Email notification (Markdown->HTML) sent successfully")
+        return True
+    except Exception as ex:
+        logging.warning(f"Email send failed: {ex}")
+        return False
+
 def send_notification(photo_id, caption):
     uploaded_url = get_jellyfin_image_and_upload_imgbb(photo_id)
     """
@@ -434,6 +530,17 @@ def send_notification(photo_id, caption):
         else:
             logging.warning("Notification failed via Signal")
     # --------------------------
+
+    # ======= EMAIL: письмо с inline-картинкой из Jellyfin =======
+    try:
+        email_ok = send_email_with_image_jellyfin(photo_id, subject=SMTP_SUBJECT, body_markdown=caption)
+        if email_ok:
+            logging.info("Notification sent via Email")
+        else:
+            logging.warning("Notification failed via Email")
+    except Exception as em_ex:
+        logging.warning(f"Email send failed: {em_ex}")
+
     # ======= WHATSAPP: отправляем картинку с подписью =======
     try:
         wa_jid = _wa_get_jid_from_env()
