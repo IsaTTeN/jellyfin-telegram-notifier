@@ -1,6 +1,4 @@
 import logging
-from logging.handlers import TimedRotatingFileHandler
-from datetime import datetime, timedelta #, time
 import os
 import json
 import requests
@@ -9,15 +7,17 @@ import re
 import base64
 import threading
 import time
+import markdown
+import smtplib
 from requests.exceptions import HTTPError
 from flask import Flask, request
 from dotenv import load_dotenv
 from apprise import Apprise
 from urllib.parse import quote
-import smtplib
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
-import markdown  # Markdown -> HTML
+from logging.handlers import TimedRotatingFileHandler
+from datetime import datetime, timedelta
 
 load_dotenv()
 app = Flask(__name__)
@@ -239,6 +239,12 @@ def upload_image_to_imgbb(image_bytes):
     uploaded_image_url = None
     imgbb_upload_done.clear()  # Сброс события
 
+    # Проверка наличия ключа API
+    if not IMGBB_API_KEY:
+        logging.debug("IMGBB_API_KEY не задан — пропускаем загрузку на imgbb.")
+        imgbb_upload_done.set()  # Сигнал о завершении (пропуск загрузки)
+        return None
+
     url = "https://api.imgbb.com/1/upload"
     payload = {
         "key": IMGBB_API_KEY,
@@ -284,39 +290,63 @@ def get_jellyfin_image_and_upload_imgbb(photo_id):
         return None
 
 def send_discord_message(photo_id, message, title="Jellyfin", uploaded_url=None):
-    img_url = wait_for_imgbb_upload()
-    if not img_url:
-        logging.warning("Изображение не загружено — пропускаем отправку в Discord.")
-        return
     """
-    Отправляет уведомление (текст и картинку) в Discord через Webhook.
-    Картинка — из imgbb, как и для Gotify.
+    Отправляет уведомление в Discord через Webhook.
+    Картинку берём НАПРЯМУЮ из Jellyfin и прикрепляем как файл.
+    Embed ссылается на неё через attachment://filename.
     """
     if not DISCORD_WEBHOOK_URL:
         logging.warning("DISCORD_WEBHOOK_URL not set, skipping Discord notification.")
         return None
 
-    if uploaded_url is None:
-        uploaded_url = get_jellyfin_image_and_upload_imgbb(photo_id)
+    # 1) тянем постер из Jellyfin
+    jellyfin_image_url = f"{JELLYFIN_BASE_URL}/Items/{photo_id}/Images/Primary"
+    image_bytes = None
+    filename = "poster.jpg"
+    mimetype = "image/jpeg"
+    try:
+        r = requests.get(jellyfin_image_url, timeout=30)
+        r.raise_for_status()
+        image_bytes = r.content
+        ct = r.headers.get("Content-Type", "image/jpeg").split(";")[0].strip().lower()
+        if "png" in ct:
+            filename, mimetype = "poster.png", "image/png"
+        elif "webp" in ct:
+            filename, mimetype = "poster.webp", "image/webp"
+    except Exception as ex:
+        logging.warning(f"Discord: failed to fetch image from Jellyfin: {ex}")
 
-    data = {
+    # 2) готовим payload
+    payload = {
         "username": title,
         "content": message
     }
 
-    # Если есть картинка — добавляем embed с изображением
-    if uploaded_url:
-        data["embeds"] = [
-            {
-                "image": {"url": uploaded_url}
-            }
-        ]
+    # если есть картинка — добавим embed, указывающий на attachment
+    if image_bytes:
+        payload["embeds"] = [{
+            "image": {"url": f"attachment://{filename}"}
+        }]
 
     try:
-        response = requests.post(DISCORD_WEBHOOK_URL, json=data)
-        response.raise_for_status()
+        if image_bytes:
+            # multipart: payload_json + файл
+            files = {
+                "file": (filename, image_bytes, mimetype)
+            }
+            resp = requests.post(
+                DISCORD_WEBHOOK_URL,
+                data={"payload_json": json.dumps(payload, ensure_ascii=False)},
+                files=files,
+                timeout=30
+            )
+        else:
+            # без картинки — обычный JSON
+            resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
+
+        resp.raise_for_status()
         logging.info("Discord notification sent successfully")
-        return response
+        return resp
     except Exception as ex:
         logging.warning(f"Error sending to Discord: {ex}")
         return None
