@@ -75,6 +75,8 @@ SMTP_FROM = os.environ.get("SMTP_FROM", "")
 SMTP_TO   = os.environ.get("SMTP_TO", "")  # список через запятую/пробел
 SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "1") not in ("0", "", "false", "False")   # для STARTTLS (587)
 SMTP_USE_SSL = os.environ.get("SMTP_USE_SSL", "0") in ("1", "true", "True")   # для SMTPS (465); если 1, то TLS не используем
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
+SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "")   # ID канала, например C0123456789
 #выключить логику пропуска по датам
 #DEBUG_DISABLE_DATE_CHECKS = True
 # Глобальные переменные
@@ -497,6 +499,181 @@ def send_email_with_image_jellyfin(photo_id: str, subject: str, body_markdown: s
         logging.warning(f"Email send failed: {ex}")
         return False
 
+def _slack_try_join_channel(channel_id: str) -> bool:
+    """
+    Пытается добавить бота в PUBLIC-канал (требует scope channels:join).
+    Для приватных каналов не сработает — нужно вручную /invite в Slack.
+    """
+    if not (SLACK_BOT_TOKEN and channel_id):
+        return False
+    try:
+        resp = requests.post(
+            "https://slack.com/api/conversations.join",
+            headers={
+                "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            json={"channel": channel_id},
+            timeout=15,
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            logging.debug(f"Slack join failed/ignored: {data.get('error')}")
+            return False
+        return True
+    except Exception as ex:
+        logging.debug(f"Slack join error: {ex}")
+        return False
+
+def send_slack_text_only(message_markdown: str) -> bool:
+    """
+    Фоллбэк на чат без файла. Использует chat.postMessage.
+    """
+    if not (SLACK_BOT_TOKEN and SLACK_CHANNEL_ID):
+        logging.debug("Slack disabled/misconfigured; skip text.")
+        return False
+
+    url = "https://slack.com/api/chat.postMessage"
+    # Slack понимает mrkdwn (не совсем Markdown). Можно слегка «очистить» текст:
+    text_plain = sanitize_whatsapp_text(message_markdown) or ""
+
+    headers = {
+        "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+    payload = {
+        "channel": SLACK_CHANNEL_ID,
+        "text": text_plain,
+        "mrkdwn": True,
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("ok"):
+            logging.warning(f"Slack chat.postMessage error: {data}")
+            return False
+        logging.info("Slack text message sent successfully")
+        return True
+    except Exception as ex:
+        logging.warning(f"Slack text send failed: {ex}")
+        return False
+
+
+def send_slack_message_with_image_from_jellyfin(photo_id: str, caption_markdown: str) -> bool:
+    """
+    Slack: загрузка файла по новому потоку:
+      1) files.getUploadURLExternal (получаем upload_url и file_id)
+      2) POST байтов картинки на upload_url
+      3) files.completeUploadExternal (channel_id + initial_comment)
+    Фоллбэк: отправляем просто текст через chat.postMessage.
+    """
+    if not (SLACK_BOT_TOKEN and SLACK_CHANNEL_ID):
+        logging.debug("Slack disabled/misconfigured; skip.")
+        return False
+
+    # 1) достаём картинку из Jellyfin
+    img_bytes = None
+    filename = "poster.jpg"
+    mimetype = "image/jpeg"
+    try:
+        if "_fetch_jellyfin_primary" in globals():
+            b, mt, fn = _fetch_jellyfin_primary(photo_id)
+            img_bytes, mimetype, filename = b, mt, fn
+        else:
+            jf_url = f"{JELLYFIN_BASE_URL}/Items/{photo_id}/Images/Primary"
+            r = requests.get(jf_url, timeout=30)
+            r.raise_for_status()
+            img_bytes = r.content
+            ct = r.headers.get("Content-Type", "image/jpeg").split(";")[0].strip().lower()
+            if "png" in ct:
+                filename, mimetype = "poster.png", "image/png"
+            elif "webp" in ct:
+                filename, mimetype = "poster.webp", "image/webp"
+    except Exception as ex:
+        logging.warning(f"Slack: failed to fetch image from Jellyfin: {ex}")
+
+    if not img_bytes:
+        # нет картинки — отправим текст
+        return send_slack_text_only(caption_markdown)
+
+    # 2) files.getUploadURLExternal
+    auth_h = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    try:
+        resp = requests.post(
+            "https://slack.com/api/files.getUploadURLExternal",
+            headers=auth_h,
+            data={"filename": filename, "length": str(len(img_bytes))},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("ok"):
+            logging.warning(f"Slack getUploadURLExternal error: {data}")
+            return send_slack_text_only(caption_markdown)
+        upload_url = data["upload_url"]
+        file_id    = data["file_id"]
+    except Exception as ex:
+        logging.warning(f"Slack getUploadURLExternal failed: {ex}")
+        return send_slack_text_only(caption_markdown)
+
+    # 3) POST файла на upload_url
+    try:
+        # можно сырыми байтами:
+        up_headers = {"Content-Type": mimetype}
+        up = requests.post(upload_url, data=img_bytes, headers=up_headers, timeout=60)
+        # альтернативно: multipart (иногда помогает при прокси):
+        # up = requests.post(upload_url, files={"filename": (filename, img_bytes, mimetype)}, timeout=60)
+        if up.status_code != 200:
+            logging.warning(f"Slack upload_url returned {up.status_code}: {up.text[:200]}")
+            return send_slack_text_only(caption_markdown)
+    except Exception as ex:
+        logging.warning(f"Slack raw upload failed: {ex}")
+        return send_slack_text_only(caption_markdown)
+
+    # 4) files.completeUploadExternal (шарим файл в канал + комментарий)
+    def _complete_upload():
+        comp_payload = {
+            "files": [{"id": file_id, "title": filename}],
+            "channel_id": SLACK_CHANNEL_ID,
+            "initial_comment": sanitize_whatsapp_text(caption_markdown) or "",
+        }
+        return requests.post(
+            "https://slack.com/api/files.completeUploadExternal",
+            headers={**auth_h, "Content-Type": "application/json; charset=utf-8"},
+            json=comp_payload,
+            timeout=30,
+        )
+
+    # попытка заранее присоединиться (на случай публичного канала)
+    _slack_try_join_channel(SLACK_CHANNEL_ID)
+
+    try:
+        comp = _complete_upload()
+        comp.raise_for_status()
+        comp_data = comp.json()
+        if not comp_data.get("ok"):
+            if comp_data.get("error") == "not_in_channel":
+                # пробуем присоединиться и повторить один раз
+                if _slack_try_join_channel(SLACK_CHANNEL_ID):
+                    comp = _complete_upload()
+                    comp.raise_for_status()
+                    comp_data = comp.json()
+                    if comp_data.get("ok"):
+                        logging.info("Slack image sent successfully (after join).")
+                        return True
+                logging.warning("Slack: bot is not in the channel. Invite the app (/invite @Bot) and retry.")
+            else:
+                logging.warning(f"Slack completeUploadExternal error: {comp_data}")
+            return send_slack_text_only(caption_markdown)
+
+        logging.info("Slack image (external upload flow) sent successfully")
+        return True
+
+    except Exception as ex:
+        logging.warning(f"Slack completeUploadExternal failed: {ex}")
+        return send_slack_text_only(caption_markdown)
+
 def send_notification(photo_id, caption):
     uploaded_url = get_jellyfin_image_and_upload_imgbb(photo_id)
     """
@@ -532,6 +709,19 @@ def send_notification(photo_id, caption):
         else:
             logging.warning("Notification failed via Discord")
     # =====================================
+    # ======= SLACK: файл-изображение с комментарием =======
+    try:
+        if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID:
+            ok = send_slack_message_with_image_from_jellyfin(photo_id, caption)
+            if ok:
+                logging.info("Notification sent via Slack")
+            else:
+                logging.warning("Notification failed via Slack")
+        else:
+            logging.debug("Slack disabled or not configured; skip.")
+    except Exception as sl_ex:
+        logging.warning(f"Slack send failed: {sl_ex}")
+    # ======================================================
     # ======= MATRIX (REST): СНАЧАЛА изображение из Jellyfin, затем текст =======
     try:
         if MATRIX_URL and MATRIX_ACCESS_TOKEN and MATRIX_ROOM_ID:
