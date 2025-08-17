@@ -23,7 +23,8 @@ load_dotenv()
 app = Flask(__name__)
 
 # Set up logging
-log_directory = '/app/log'
+#log_directory = '/app/log'
+log_directory = 'A:/git'
 log_filename = os.path.join(log_directory, 'jellyfin_telegram-notifier.log')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -91,7 +92,8 @@ for url in APPRISE_URLS.split():
     apobj.add(url)
 
 # Path for the JSON file to store notified items
-notified_items_file = '/app/data/notified_items.json'
+#notified_items_file = '/app/data/notified_items.json'
+notified_items_file = 'A:/git/notified_items.json'
 
 # Убедимся, что папка /app/data существует
 os.makedirs(os.path.dirname(notified_items_file), exist_ok=True)
@@ -369,7 +371,8 @@ def clean_markdown_for_apprise(text):
         trailer_label = t("new_trailer")
     except Exception:
         trailer_label = MESSAGES.get(LANG, {}).get("new_trailer", "Trailer")
-
+    if not trailer_label:
+        trailer_label = "Trailer"
     # 1) [текст](url) -> url
     text = re.sub(r'\[([^\]]+)\]\((https?://[^\s)]+)\)', r'\2', text)
 
@@ -381,9 +384,14 @@ def clean_markdown_for_apprise(text):
     prefix_pattern = rf'🎥\s*{re.escape(trailer_label)}[:]?\s*'
     text = re.sub(rf'{prefix_pattern}(https?://\S+)', r'\1', text)
 
-    # 4) Добавляем "🎥 <label>:" перед каждой ссылкой
-    text = re.sub(r'(https?://\S+)', rf'🎥 {trailer_label}: \1', text)
+    # 4) Префиксуем ТОЛЬКО не-musicbrainz ссылки (через колбэк)
+    def _prefix_non_mb(m):
+        url = m.group(1)
+        if re.search(r'https?://(?:[^/\s)]+\.)*musicbrainz\.org(?=[/\s)]|$)', url, re.IGNORECASE):
+            return url
+        return f'🎥 {trailer_label}: {url}'
 
+    text = re.sub(r'(https?://\S+)', _prefix_non_mb, text)
     # 5) Чистим лишние пробелы по краям строк (сохраняем переносы)
     text = '\n'.join(line.strip() for line in text.split('\n'))
 
@@ -406,12 +414,21 @@ def sanitize_whatsapp_text(text: str) -> str:
     # 2) Убираем подряд идущие повторы одного и того же URL
     text = re.sub(r'(https?://\S+)(\s*\1)+', r'\1', text)
 
-    # 3) Добавляем 🎥 <перевод new_trailer> перед ссылкой (если ещё нет)
-    pattern = rf'(?<!🎥 {re.escape(trailer_label)}\s)(https?://\S+)'
-    replacement = rf'🎥 {trailer_label} \1'
-    text = re.sub(pattern, replacement, text)
 
-    # 4) Чистим лишние пробелы
+    # 3) Сносим уже поставленные префиксы (на всякий)
+    prefix_re = rf'🎥\s*{re.escape(trailer_label)}:?[\s]*'
+    text = re.sub(rf'{prefix_re}(https?://\S+)', r'\1', text)
+
+    # 4) Префиксуем ТОЛЬКО не-musicbrainz ссылки (через колбэк)
+    def _prefix_non_mb(m):
+        url = m.group(1)
+        if re.search(r'https?://(?:[^/\s)]+\.)*musicbrainz\.org(?=[/\s)]|$)', url, re.IGNORECASE):
+            return url
+        return f'🎥 {trailer_label} {url}'
+
+    text = re.sub(r'(https?://\S+)', _prefix_non_mb, text)
+
+    # 5) Чистим лишние пробелы
     text = re.sub(r'[ \t]+', ' ', text).strip()
 
     return text
@@ -1384,7 +1401,12 @@ def announce_new_releases_from_jellyfin():
                 return "Movie notification was sent"
 
         if item_type == "Season":
-            if not item_already_notified(item_type, item_name, release_year):
+            # формируем более информативный ключ для антиспама
+            season = item_name  # например, "Сезон 1"
+            series_title_for_key = (series_name or "").strip()
+            key_name = f"{series_title_for_key} {season}".strip()
+
+            if not item_already_notified(item_type, key_name, release_year):
                 season_id = payload.get("ItemId")
                 season = item_name
                 season_details = get_item_details(season_id)
@@ -1417,19 +1439,17 @@ def announce_new_releases_from_jellyfin():
                 if trailer_url:
                     notification_message += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
 
-                response = send_notification(season_id, notification_message)
-
-                if response.status_code == 200:
-                    mark_item_as_notified(item_type, item_name, release_year)
-                    logging.info(f"(Season) {series_name_cleaned} {season} "
-                                 f"notification was sent")
-                    return "Season notification was sent"
+                # Проверим, есть ли постер сезона — если нет, шлём с постером сериала
+                if _fetch_jellyfin_image_with_retries(season_id, attempts=1, timeout=3):
+                    send_notification(season_id, notification_message)
                 else:
                     send_notification(series_id, notification_message)
-                    mark_item_as_notified(item_type, item_name, release_year)
-                    logging.warning(f"{series_name_cleaned} {season} image does not exists, falling back to series image")
-                    logging.info(f"(Season) {series_name_cleaned} {season} notification was sent")
-                    return "Season notification was sent"
+                    logging.warning(
+                        f"{series_name_cleaned} {season} image does not exist, falling back to series image")
+
+                mark_item_as_notified(item_type, key_name, release_year)
+                logging.info(f"(Season) {series_name_cleaned} {season} notification was sent")
+                return "Season notification was sent"
 
         if item_type == "Episode":
             if not item_already_notified(item_type, item_name, release_year):
@@ -1458,19 +1478,17 @@ def announce_new_releases_from_jellyfin():
                         f"*{t('new_episode_title')}*\n\n*{t('new_release_date')}*: {episode_premiere_date}\n\n*{t('new_series')}*: {series_name} *S*"
                         f"{season_num}*E*{season_epi}\n*{t('new_episode_t')}*: {epi_name}\n\n{overview}\n\n"
                     )
-                    response = send_notification(season_id, notification_message)
-
-                    if response.status_code == 200:
-                        mark_item_as_notified(item_type, item_name, release_year)
-                        logging.info(f"(Episode) {series_name} S{season_num}E{season_epi} notification sent!")
-                        return "Notification sent!"
+                    # Постер сезона может отсутствовать — проверим заранее и при необходимости уйдём на постер сериала
+                    if _fetch_jellyfin_image_with_retries(season_id, attempts=1, timeout=3):
+                        send_notification(season_id, notification_message)
                     else:
                         send_notification(series_id, notification_message)
-                        logging.warning(f"(Episode) {series_name} season image does not exists, "
-                                        f"falling back to series image")
-                        mark_item_as_notified(item_type, item_name, release_year)
-                        logging.info(f"(Episode) {series_name} S{season_num}E{season_epi} notification sent!")
-                        return "Notification sent!"
+                        logging.warning(
+                            f"(Episode) {series_name} season image does not exist, falling back to series image")
+
+                    mark_item_as_notified(item_type, item_name, release_year)
+                    logging.info(f"(Episode) {series_name} S{season_num}E{season_epi} notification sent!")
+                    return "Notification sent!"
 
                 else:
                     logging.info(f"(Episode) {series_name} S{season_num}E{season_epi} "
@@ -1480,7 +1498,12 @@ def announce_new_releases_from_jellyfin():
                             f"days ago. Not sending notification.")
 
         if item_type == "MusicAlbum":
-            if not item_already_notified(item_type, item_name, release_year):
+            # читаем исполнителя/альбом заранее, чтобы сформировать ключ
+            album_name = payload.get("Name")
+            artist = payload.get("Artist")
+            key_name = f"{artist} – {album_name}".strip()
+
+            if not item_already_notified(item_type, key_name, release_year):
                 album_id = payload.get("ItemId")
                 album_name = payload.get("Name")
                 artist = payload.get("Artist")
@@ -1502,19 +1525,10 @@ def announce_new_releases_from_jellyfin():
                     f"{f'[MusicBrainz]({mb_link})' if mb_link else ''}\n"
                 )
 
-                # Отправляем обложку альбома, если есть, иначе ничего страшного
-                response = send_notification(album_id, notification_message)
-
-                # Фиксируем уведомление как отправленное
-                mark_item_as_notified(item_type, item_name, release_year)
-
-                if response.status_code == 200:
-                    logging.info(f"(Album) {artist} – {album_name} ({year}) notification sent.")
-                    return "Album notification was sent to telegram"
-                else:
-                    # можно при падении картинки просто залогировать и вернуть успех, чтобы не спамить
-                    logging.warning(f"Album cover not found for {album_name}, sent text-only message.")
-                    return "Album notification was sent to telegram"
+                send_notification(album_id, notification_message)
+                mark_item_as_notified(item_type, key_name, release_year)
+                logging.info(f"(Album) {artist} – {album_name} ({year}) notification sent.")
+                return "Album notification was sent to telegram"
 
         if item_type == "Movie":
             logging.info(f"(Movie) {item_name} Notification Was Already Sent")
