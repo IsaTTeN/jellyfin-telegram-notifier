@@ -78,6 +78,8 @@ SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "1") not in ("0", "", "false", "Fa
 SMTP_USE_SSL = os.environ.get("SMTP_USE_SSL", "0") in ("1", "true", "True")   # для SMTPS (465); если 1, то TLS не используем
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "")   # ID канала, например C0123456789
+#выключение контроля добавленного контента
+DISABLE_DEDUP = os.getenv("NOTIFIER_DISABLE_DEDUP", "0").lower() in ("1", "true", "yes")
 #выключить логику пропуска по датам
 #DEBUG_DISABLE_DATE_CHECKS = True
 # Глобальные переменные
@@ -1334,26 +1336,29 @@ def get_youtube_trailer_url(query):
 
 
 def item_already_notified(item_type, item_name, release_year):
+    # В режиме теста всегда считаем, что ещё не отправляли
+    if DISABLE_DEDUP:
+        logging.debug("Dedup is disabled: treating as NOT notified.")
+        return False
+
     key = f"{item_type}:{item_name}:{release_year}"
-    return key in notified_items
+    return notified_items.get(key) is True
 
 
-def mark_item_as_notified(item_type, item_name, release_year, max_entries=100):
+def mark_item_as_notified(item_type, item_name, release_year, max_items=100):
+    # В режиме теста ничего не пишем в файл
+    if DISABLE_DEDUP:
+        logging.debug("Dedup is disabled: NOT recording notified key.")
+        return
+
     key = f"{item_type}:{item_name}:{release_year}"
     notified_items[key] = True
 
-    # Check if the number of entries in notified_items exceeds the limit
-    if len(notified_items) > max_entries:
-        # Get a list of keys (notification identifiers) sorted by their insertion order (oldest first)
-        keys_sorted_by_insertion_order = sorted(notified_items, key=notified_items.get)
-
-        # Remove the oldest entry from the dictionary
-        oldest_key = keys_sorted_by_insertion_order[0]
-        del notified_items[oldest_key]
-        logging.info(f"Key '{oldest_key}' has been deleted from notified_items")
-    # Save the updated notified items to the JSON file
+    # ограничиваем размер «памяти»
+    if len(notified_items) > max_items:
+        # если уже храните timestamp — удаляйте самый старый; иначе просто pop первого
+        notified_items.pop(next(iter(notified_items)))
     save_notified_items(notified_items)
-
 
 @app.route("/webhook", methods=["POST"])
 def announce_new_releases_from_jellyfin():
