@@ -1345,6 +1345,7 @@ def item_already_notified(item_type, item_name, release_year):
     return notified_items.get(key) is True
 
 
+
 def mark_item_as_notified(item_type, item_name, release_year, max_items=100):
     # В режиме теста ничего не пишем в файл
     if DISABLE_DEDUP:
