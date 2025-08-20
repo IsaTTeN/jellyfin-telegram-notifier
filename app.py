@@ -80,7 +80,6 @@ SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "")   # ID канала, например C0123456789
 #выключение повторной отправки
 DISABLE_DEDUP = os.getenv("NOTIFIER_DISABLE_DEDUP", "0").lower() in ("1", "true", "yes")
-
 #выключить логику пропуска по датам
 #DEBUG_DISABLE_DATE_CHECKS = True
 # Глобальные переменные
