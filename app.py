@@ -18,6 +18,7 @@ from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, timedelta
+import sqlite3
 
 load_dotenv()
 app = Flask(__name__)
@@ -79,7 +80,11 @@ SMTP_USE_SSL = os.environ.get("SMTP_USE_SSL", "0") in ("1", "true", "True")   # 
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "")   # ID канала, например C0123456789
 #выключение контроля добавленного контента
-DISABLE_DEDUP = os.getenv("NOTIFIER_DISABLE_DEDUP", "0").lower() in ("1", "true", "yes")
+DISABLE_DEDUP = os.getenv("NOTIFIER_DISABLE_DEDUP", "1").lower() in ("1", "true", "yes")
+#настройки для фильмов
+MOVIE_POLL_ENABLED = os.getenv("MOVIE_POLL_ENABLED", "1").lower() in ("1", "true", "yes")
+MOVIE_POLL_INTERVAL_SEC = int(os.getenv("MOVIE_POLL_INTERVAL_SEC", "300"))   # каждые 5 минут
+MOVIE_POLL_LIMIT = int(os.getenv("MOVIE_POLL_LIMIT", "200"))                 # смотреть до 200 последних фильмов
 #выключить логику пропуска по датам
 #DEBUG_DISABLE_DATE_CHECKS = True
 # Глобальные переменные
@@ -96,6 +101,65 @@ for url in APPRISE_URLS.split():
 # Path for the JSON file to store notified items
 #notified_items_file = '/app/data/notified_items.json'
 notified_items_file = 'A:/git/notified_items.json'
+
+# === SQLite для качества (только для Movie на первом этапе) ===
+QUALITY_DB_FILE = os.path.join(os.path.dirname(notified_items_file), "media_quality.db")
+os.makedirs(os.path.dirname(QUALITY_DB_FILE), exist_ok=True)
+
+def _init_quality_db():
+    conn = sqlite3.connect(QUALITY_DB_FILE)
+    try:
+        cur = conn.cursor()
+        # снимок по конкретному ItemId (история)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS media_quality (
+            item_id TEXT PRIMARY KEY,
+            movie_name TEXT,
+            year INTEGER,
+            video_codec TEXT,
+            video_bitrate INTEGER,
+            width INTEGER,
+            height INTEGER,
+            fps REAL,
+            bit_depth INTEGER,
+            dynamic_range TEXT,
+            audio_codec TEXT,
+            audio_bitrate INTEGER,
+            audio_channels INTEGER,
+            container TEXT,
+            size_bytes INTEGER,
+            duration_sec REAL,
+            signature TEXT,
+            date_seen TEXT
+        )""")
+        # "последняя версия" по логическому ключу (tmdb/imdb или name+year)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS content_quality (
+            logical_key TEXT PRIMARY KEY,
+            last_item_id TEXT,
+            movie_name TEXT,
+            year INTEGER,
+            video_codec TEXT,
+            video_bitrate INTEGER,
+            width INTEGER,
+            height INTEGER,
+            fps REAL,
+            bit_depth INTEGER,
+            dynamic_range TEXT,
+            audio_codec TEXT,
+            audio_bitrate INTEGER,
+            audio_channels INTEGER,
+            container TEXT,
+            size_bytes INTEGER,
+            duration_sec REAL,
+            signature TEXT,
+            date_seen TEXT
+        )""")
+        conn.commit()
+    finally:
+        conn.close()
+
+_init_quality_db()
 
 # Убедимся, что папка /app/data существует
 os.makedirs(os.path.dirname(notified_items_file), exist_ok=True)
@@ -133,6 +197,7 @@ MESSAGES = {
         "new_release_date": "Release Date",
         "new_series": "Series",
         "new_episode_t": "Episode Title",
+        "audio_tracks": "Audio tracks",
     },
     "ru": {
         "new_movie_title": "🍿Новый фильм добавлен🍿",
@@ -146,6 +211,7 @@ MESSAGES = {
         "new_release_date": "Дата выхода",
         "new_series": "Сериал",
         "new_episode_t": "Название эпизода",
+        "audio_tracks": "Аудио-дорожки",
     }
 }
 #Выбираем рабочий язык: если заданный отсутствует в MESSAGES — ставим en
@@ -1360,6 +1426,483 @@ def mark_item_as_notified(item_type, item_name, release_year, max_items=100):
         notified_items.pop(next(iter(notified_items)))
     save_notified_items(notified_items)
 
+# Сравнение данных о видео
+
+def _get_item_media_info_movie(item_id: str) -> dict:
+    """
+    Тянем MediaSources/MediaStreams для фильма и уплощаем в dict.
+    Теперь дополнительно возвращаем список аудио-дорожек: audio_tracks + их количество.
+    """
+    try:
+        headers = {'accept': 'application/json'}
+        params = {'api_key': JELLYFIN_API_KEY}
+        url = f"{JELLYFIN_BASE_URL}/emby/Items?Ids={item_id}&Fields=MediaSources,RunTimeTicks"
+        r = requests.get(url, headers=headers, params=params, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        item = (data.get("Items") or [{}])[0]
+        sources = item.get("MediaSources") or []
+        if not sources:
+            return {}
+        src = sources[0]
+
+        container = src.get("Container")
+        overall_bitrate = src.get("Bitrate")
+        size_bytes = src.get("Size")
+        duration_ticks = src.get("RunTimeTicks") or item.get("RunTimeTicks")
+        duration_sec = duration_ticks / 10_000_000 if duration_ticks else None
+
+        vcodec = None; vbitrate = None; width = None; height = None; dyn = None; vdepth = None; fps = None
+        acodec = None; abitrate = None; channels = None
+
+        audio_tracks = []
+
+        for s in (src.get("MediaStreams") or []):
+            stype = s.get("Type")
+            if stype == "Video" and vcodec is None:
+                vcodec = s.get("Codec")
+                vbitrate = s.get("BitRate") or s.get("bitrate") or overall_bitrate
+                width = s.get("Width"); height = s.get("Height")
+                fps = s.get("AverageFrameRate") or s.get("RealFrameRate")
+                vdepth = s.get("BitDepth") or s.get("VideoBitDepth")
+                dyn = s.get("ColorTransfer") or s.get("VideoRange") or s.get("ColorPrimaries")
+                if isinstance(dyn, str):
+                    u = dyn.upper()
+                    dyn = "HDR" if ("PQ" in u or "HLG" in u or "HDR" in u or "BT2020" in u) else "SDR"
+            elif stype == "Audio":
+                # основной аудио-снимок (для сводки)
+                if acodec is None:
+                    acodec = s.get("Codec")
+                    abitrate = s.get("BitRate") or s.get("bitrate")
+                    channels = s.get("Channels")
+                # читаем «человеческое» имя дорожки
+                label = s.get("DisplayTitle") or s.get("Title")
+                if not label:
+                    lang = s.get("Language")
+                    codec = s.get("Codec")
+                    ch = s.get("Channels")
+                    layout = s.get("ChannelLayout")
+                    parts = []
+                    if lang:   parts.append(str(lang).upper())
+                    if codec:  parts.append(str(codec).upper())
+                    if ch:     parts.append(f"{ch}ch")
+                    if layout: parts.append(layout)
+                    label = " ".join(parts) or "Audio"
+                audio_tracks.append(label)
+
+        approx_kbps = None
+        if (not vbitrate) and size_bytes and duration_sec and duration_sec > 0:
+            approx_kbps = int((size_bytes * 8) / duration_sec / 1000)
+
+        return {
+            "video_codec": vcodec,
+            "video_bitrate": vbitrate,
+            "approx_video_kbps": approx_kbps,
+            "width": width,
+            "height": height,
+            "fps": fps,
+            "bit_depth": vdepth,
+            "dynamic_range": dyn or "SDR",
+            "audio_codec": acodec,
+            "audio_bitrate": abitrate,
+            "audio_channels": channels,
+            "container": container,
+            "size_bytes": size_bytes,
+            "duration_sec": duration_sec,
+            # НОВОЕ:
+            "audio_tracks": audio_tracks,
+            "audio_track_count": len(audio_tracks),
+        }
+    except Exception as ex:
+        logging.warning(f"Media info fetch failed for movie {item_id}: {ex}")
+        return {}
+
+def build_audio_tracks_block(q: dict) -> str:
+    tracks = (q or {}).get("audio_tracks") or []
+    if not tracks:
+        return ""
+    header = t("audio_tracks")
+    lines = "\n".join(f"- {name}" for name in tracks)
+    return f"\n\n*{header} ({len(tracks)})*\n{lines}"
+
+def _quality_signature(q: dict) -> str:
+    """
+    Компактный ключ качества: достаточно чувствителен к реальной замене файла.
+    """
+    def part(x): return "-" if x in (None, "", 0) else str(x)
+    vbr = q.get("video_bitrate") or q.get("approx_video_kbps")
+    return "|".join([
+        part(q.get("video_codec")),
+        f"{part(q.get('width'))}x{part(q.get('height'))}",
+        part(vbr),
+        part(q.get("dynamic_range")),
+        part(q.get("bit_depth")),
+        part(q.get("fps")),
+        part(q.get("audio_codec")),
+        part(q.get("audio_channels")),
+        part(q.get("audio_bitrate")),
+        part(q.get("container")),
+        part(q.get("size_bytes")),
+    ])
+
+def _quality_is_substantial(q: dict | None) -> bool:
+    """False, если «пустой» снимок (Jellyfin ещё не распарсил потоки)."""
+    if not q: return False
+    return any([
+        q.get("video_codec"),
+        (q.get("width") and q.get("height")),
+        q.get("audio_codec"),
+        q.get("container"),
+        q.get("size_bytes"),
+    ])
+
+def _fmt_mbps(q: dict) -> str:
+    vbr = q.get("video_bitrate")
+    if vbr:
+        try: return f"{int(vbr)/1000:.1f} Mbps"
+        except: return f"{vbr} kbps"
+    kbps = q.get("approx_video_kbps")
+    return f"{kbps/1000:.1f} Mbps (≈)" if kbps else "-"
+
+def _format_quality_human(q: dict) -> str:
+    if not q: return "unknown"
+    w,h = q.get("width"), q.get("height")
+    res = f"{w}x{h}" if (w and h) else "-"
+    vcodec = (q.get("video_codec") or "-").upper()
+    acodec = (q.get("audio_codec") or "-").upper()
+    dr = q.get("dynamic_range") or "-"
+    ch = q.get("audio_channels") or "-"
+    cont = (q.get("container") or "-").upper()
+    fps = q.get("fps")
+    fps_str = f" {float(fps):.3f}fps" if isinstance(fps, (int, float)) else ""
+    bd = q.get("bit_depth")
+    bd_str = f" {bd}-bit" if bd else ""
+    return f"{res} {vcodec}{bd_str} {dr}{fps_str} | {acodec} {ch}ch | {cont} | {_fmt_mbps(q)}"
+
+def _movie_logical_key(*, tmdb_id: str | None, imdb_id: str | None, name: str, year: int | None) -> str:
+    if tmdb_id: return f"movie:tmdb:{tmdb_id}"
+    if imdb_id: return f"movie:imdb:{imdb_id}"
+    # фолбэк: name+year в нижнем регистре
+    key_name = re.sub(r"\s+", " ", (name or "").strip().lower())
+    return f"movie:nameyear:{key_name}:{year or ''}"
+
+def store_quality_snapshot_movie(*, item_id: str, name: str, year: int | None,
+                                 tmdb_id: str | None, imdb_id: str | None) -> dict:
+    """
+    1) Тянем качество из Jellyfin
+    2) Upsert в media_quality (по ItemId)
+    3) Сравниваем и upsert в content_quality (по логическому ключу)
+    Возвращаем флаги: logical_inserted, logical_changed, old_quality, new_quality
+    """
+    q = _get_item_media_info_movie(item_id)
+    sig = _quality_signature(q)
+    now = datetime.now().isoformat(timespec='seconds')
+
+    result = {
+        "logical_inserted": False,
+        "logical_changed": False,
+        "old_quality": None,
+        "new_quality": q,
+        "old_signature": None,
+        "new_signature": sig,
+        "logical_key": None
+    }
+
+    logical_key = _movie_logical_key(tmdb_id=tmdb_id, imdb_id=imdb_id, name=name, year=year)
+    result["logical_key"] = logical_key
+
+    conn = sqlite3.connect(QUALITY_DB_FILE)
+    try:
+        cur = conn.cursor()
+        # --- media_quality по ItemId
+        cur.execute("SELECT signature FROM media_quality WHERE item_id=?", (item_id,))
+        if cur.fetchone() is None:
+            cur.execute("""INSERT INTO media_quality
+                (item_id, movie_name, year, video_codec, video_bitrate, width, height, fps, bit_depth, dynamic_range,
+                 audio_codec, audio_bitrate, audio_channels, container, size_bytes, duration_sec, signature, date_seen)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (item_id, name, year, q.get("video_codec"), q.get("video_bitrate"),
+                 q.get("width"), q.get("height"), q.get("fps"), q.get("bit_depth"), q.get("dynamic_range"),
+                 q.get("audio_codec"), q.get("audio_bitrate"), q.get("audio_channels"),
+                 q.get("container"), q.get("size_bytes"), q.get("duration_sec"), sig, now)
+            )
+        else:
+            cur.execute("""UPDATE media_quality SET
+                 movie_name=?, year=?, video_codec=?, video_bitrate=?, width=?, height=?, fps=?, bit_depth=?,
+                 dynamic_range=?, audio_codec=?, audio_bitrate=?, audio_channels=?, container=?, size_bytes=?,
+                 duration_sec=?, signature=?, date_seen=? WHERE item_id=?""",
+                (name, year, q.get("video_codec"), q.get("video_bitrate"),
+                 q.get("width"), q.get("height"), q.get("fps"), q.get("bit_depth"), q.get("dynamic_range"),
+                 q.get("audio_codec"), q.get("audio_bitrate"), q.get("audio_channels"),
+                 q.get("container"), q.get("size_bytes"), q.get("duration_sec"), sig, now, item_id)
+            )
+
+        # --- content_quality по logical_key
+        cur.execute("""SELECT signature, last_item_id, video_codec, video_bitrate, width, height, fps, bit_depth,
+                              dynamic_range, audio_codec, audio_bitrate, audio_channels, container, size_bytes, duration_sec
+                       FROM content_quality WHERE logical_key=?""", (logical_key,))
+        row = cur.fetchone()
+        if row is None:
+            # если снимок «пустой», не считаем это «логической вставкой» — ждём полноценный парс
+            if _quality_is_substantial(q):
+                cur.execute("""INSERT INTO content_quality
+                    (logical_key, last_item_id, movie_name, year, video_codec, video_bitrate, width, height, fps, bit_depth,
+                     dynamic_range, audio_codec, audio_bitrate, audio_channels, container, size_bytes, duration_sec, signature, date_seen)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (logical_key, item_id, name, year, q.get("video_codec"), q.get("video_bitrate"),
+                     q.get("width"), q.get("height"), q.get("fps"), q.get("bit_depth"), q.get("dynamic_range"),
+                     q.get("audio_codec"), q.get("audio_bitrate"), q.get("audio_channels"),
+                     q.get("container"), q.get("size_bytes"), q.get("duration_sec"), sig, now)
+                )
+                result["logical_inserted"] = True
+        else:
+            old_sig, old_item_id = row[0], row[1]
+            old_q = {
+                "video_codec": row[2], "video_bitrate": row[3], "width": row[4], "height": row[5],
+                "fps": row[6], "bit_depth": row[7], "dynamic_range": row[8],
+                "audio_codec": row[9], "audio_bitrate": row[10], "audio_channels": row[11],
+                "container": row[12], "size_bytes": row[13], "duration_sec": row[14]
+            }
+            result["old_signature"] = old_sig
+            result["old_quality"] = old_q
+
+            if old_sig != sig and _quality_is_substantial(old_q) and _quality_is_substantial(q):
+                result["logical_changed"] = True
+                cur.execute("""UPDATE content_quality SET
+                    last_item_id=?, movie_name=?, year=?, video_codec=?, video_bitrate=?, width=?, height=?, fps=?, bit_depth=?,
+                    dynamic_range=?, audio_codec=?, audio_bitrate=?, audio_channels=?, container=?, size_bytes=?, duration_sec=?,
+                    signature=?, date_seen=? WHERE logical_key=?""",
+                    (item_id, name, year, q.get("video_codec"), q.get("video_bitrate"),
+                     q.get("width"), q.get("height"), q.get("fps"), q.get("bit_depth"), q.get("dynamic_range"),
+                     q.get("audio_codec"), q.get("audio_bitrate"), q.get("audio_channels"),
+                     q.get("container"), q.get("size_bytes"), q.get("duration_sec"),
+                     sig, now, logical_key)
+                )
+        conn.commit()
+    finally:
+        conn.close()
+    return result
+
+def _labels():
+    if LANG == "ru":
+        return {
+            "changes": "Изменения качества",
+            "resolution": "Разрешение",
+            "video_codec": "Видео-кодек",
+            "bitrate": "Битрейт (видео)",
+            "dynamic_range": "Динамический диапазон",
+            "audio": "Аудио",
+            "container": "Контейнер",
+            "fps": "Кадровая частота",
+            "bit_depth": "Битовая глубина",
+        }
+    return {
+        "changes": "Quality changes",
+        "resolution": "Resolution",
+        "video_codec": "Video codec",
+        "bitrate": "Bitrate (video)",
+        "dynamic_range": "Dynamic range",
+        "audio": "Audio",
+        "container": "Container",
+        "fps": "Frame rate",
+        "bit_depth": "Bit depth",
+    }
+
+def build_quality_changes_block(old_q: dict, new_q: dict) -> str:
+    L = _labels()
+    lines = []
+
+    def arrow(a,b): return f"{a} → {b}"
+
+    # Разрешение
+    def res(q):
+        w,h = q.get("width"), q.get("height")
+        return f"{w}x{h}" if (w and h) else "-"
+    if res(old_q) != res(new_q):
+        lines.append(f"- {L['resolution']}: {arrow(res(old_q), res(new_q))}")
+
+    # Видео-кодек
+    vc_old = (old_q.get("video_codec") or "-").upper()
+    vc_new = (new_q.get("video_codec") or "-").upper()
+    if vc_old != vc_new:
+        lines.append(f"- {L['video_codec']}: {arrow(vc_old, vc_new)}")
+
+    # Битрейт
+    if _fmt_mbps(old_q) != _fmt_mbps(new_q):
+        lines.append(f"- {L['bitrate']}: {arrow(_fmt_mbps(old_q), _fmt_mbps(new_q))}")
+
+    # HDR/SDR
+    dr_old = old_q.get("dynamic_range") or "-"
+    dr_new = new_q.get("dynamic_range") or "-"
+    if dr_old != dr_new:
+        lines.append(f"- {L['dynamic_range']}: {arrow(dr_old, dr_new)}")
+
+    # FPS
+    def fps(q):
+        v = q.get("fps")
+        return f"{float(v):.3f}fps" if isinstance(v, (int,float)) else "-"
+    if fps(old_q) != fps(new_q):
+        lines.append(f"- {L['fps']}: {arrow(fps(old_q), fps(new_q))}")
+
+    # Битовая глубина
+    def bd(q):
+        d = q.get("bit_depth")
+        return f"{d}-bit" if d else "-"
+    if bd(old_q) != bd(new_q):
+        lines.append(f"- {L['bit_depth']}: {arrow(bd(old_q), bd(new_q))}")
+
+    # Аудио (кодек + каналы)
+    def aud(q):
+        c = q.get("audio_channels")
+        return f"{(q.get('audio_codec') or '-').upper()} {c or '-'}ch"
+    if aud(old_q) != aud(new_q):
+        lines.append(f"- {L['audio']}: {arrow(aud(old_q), aud(new_q))}")
+
+    # Контейнер
+    cont_old = (old_q.get("container") or "-").upper()
+    cont_new = (new_q.get("container") or "-").upper()
+    if cont_old != cont_new:
+        lines.append(f"- {L['container']}: {arrow(cont_old, cont_new)}")
+
+    if not lines:
+        return ""  # ничего существенного
+    return f"\n\n*{L['changes']}*\n" + "\n".join(lines)
+
+def maybe_notify_movie_quality_change(*, item_id: str, movie_name_cleaned: str, release_year: int | None,
+                                      tmdb_id: str | None, imdb_id: str | None,
+                                      overview: str | None, runtime: str | None) -> bool:
+    """
+    Если качество фильма изменилось (по логическому ключу) — отправляем уведомление
+    тем же шаблоном, что и для нового фильма, + блок 'Изменения качества'.
+    Возвращает True, если отправили (обычное сообщение 'New Movie' слать не надо).
+    """
+    res = store_quality_snapshot_movie(
+        item_id=item_id, name=movie_name_cleaned, year=release_year,
+        tmdb_id=tmdb_id, imdb_id=imdb_id
+    )
+    if not res.get("logical_changed"):
+        return False
+
+    old_q = res.get("old_quality")
+    new_q = res.get("new_quality")
+    # Если старый снимок «пустой» — это первый нормальный парс нового фильма; считаем, что это НЕ апгрейд.
+    if not _quality_is_substantial(old_q):
+        logging.info("(Movie guard) Old quality is empty -> treat as NEW content, not a quality update.")
+        return False
+
+    # Собираем «как при добавлении»
+    notification_message = (
+        f"*{t('new_movie_title')}*\n\n*{movie_name_cleaned}* *({release_year})*\n\n{overview or ''}\n\n"
+        f"*{t('new_runtime')}*\n{runtime or ''}"
+    )
+
+    # рейтинги (если есть tmdb_id)
+    if tmdb_id:
+        ratings_text = fetch_mdblist_ratings("movie", tmdb_id)
+        if ratings_text:
+            notification_message += f"\n\n*{t('new_ratings_movie')}*\n{ratings_text}"
+
+    # трейлер
+    trailer_url = get_youtube_trailer_url(f"{movie_name_cleaned} Trailer {release_year}")
+    if trailer_url:
+        notification_message += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
+
+    # добавим блок «что изменилось»
+    # добавим блок «что изменилось»
+    delta = build_quality_changes_block(old_q, new_q)
+    if delta:
+        notification_message += delta
+
+    # НОВОЕ: перечислим аудио-дорожки текущего файла
+    tracks_block = build_audio_tracks_block(new_q)
+    if tracks_block:
+        notification_message += tracks_block
+
+    send_notification(item_id, notification_message)
+    logging.info(f"(Movie) Quality update sent for {movie_name_cleaned} ({release_year}); logical_key={res.get('logical_key')}")
+    return True
+
+def _format_runtime_from_ticks(runtime_ticks) -> str:
+    if not runtime_ticks:
+        return ""
+    try:
+        total_sec = int(runtime_ticks) // 10_000_000
+        h = total_sec // 3600
+        m = (total_sec % 3600) // 60
+        if h > 0:
+            return f"{h}h {m}m"
+        return f"{m}m"
+    except Exception:
+        return ""
+def poll_recent_movies_once():
+    """
+    Тянем последние изменённые/добавленные фильмы и проверяем, не выросло ли качество.
+    При изменении качества шлём уведомление тем же шаблоном, дополняя блоком 'Изменения качества'.
+    """
+    try:
+        params = {
+            "api_key": JELLYFIN_API_KEY,
+            "IncludeItemTypes": "Movie",
+            "Recursive": "true",
+            "SortBy": "DateModified,DateCreated",
+            "SortOrder": "Descending",
+            "Limit": str(MOVIE_POLL_LIMIT),
+            # Overview и RunTimeTicks понадобятся для текста
+            "Fields": "MediaSources,RunTimeTicks,ProviderIds,ProductionYear,Overview"
+        }
+        url = f"{JELLYFIN_BASE_URL}/emby/Items"
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        items = (r.json() or {}).get("Items") or []
+    except Exception as ex:
+        logging.warning(f"Movie poll: failed to load recent items: {ex}")
+        return
+
+    for it in items:
+        try:
+            item_id = it.get("Id")
+            name = it.get("Name") or ""
+            year = it.get("ProductionYear")
+            prov = it.get("ProviderIds") or {}
+            tmdb_id = prov.get("Tmdb") or prov.get("TmdbId")
+            imdb_id = prov.get("Imdb") or prov.get("ImdbId")
+
+            # Имя без года в скобках (как в вебхуке)
+            name_clean = name.replace(f" ({year})", "").strip()
+
+            # Overview/Runtime для шаблона
+            overview = it.get("Overview") or ""
+            runtime_str = _format_runtime_from_ticks(it.get("RunTimeTicks"))
+
+            # Используем уже написанный пред-гвард для фильмов
+            sent = maybe_notify_movie_quality_change(
+                item_id=item_id,
+                movie_name_cleaned=name_clean,
+                release_year=year,
+                tmdb_id=tmdb_id,
+                imdb_id=imdb_id,
+                overview=overview,
+                runtime=runtime_str
+            )
+            if sent:
+                # первая же отправка обновит запись в БД, на следующем проходе повторов не будет
+                continue
+        except Exception as ex:
+            logging.warning(f"Movie poll: item {it.get('Id')} failed: {ex}")
+
+def _movie_poll_loop():
+    while True:
+        try:
+            poll_recent_movies_once()
+        except Exception as ex:
+            logging.warning(f"Movie poll loop error: {ex}")
+        time.sleep(MOVIE_POLL_INTERVAL_SEC)
+
+if MOVIE_POLL_ENABLED:
+    threading.Thread(target=_movie_poll_loop, name="movie-poll", daemon=True).start()
+    logging.info(f"Movie quality polling enabled every {MOVIE_POLL_INTERVAL_SEC}s (limit={MOVIE_POLL_LIMIT})")
+
+
 @app.route("/webhook", methods=["POST"])
 def announce_new_releases_from_jellyfin():
     try:
@@ -1373,22 +1916,38 @@ def announce_new_releases_from_jellyfin():
         season_num = payload.get("SeasonNumber00")
 
         if item_type == "Movie":
-            if not item_already_notified(item_type, item_name, release_year):
-                movie_id = payload.get("ItemId")
-                overview = payload.get("Overview")
-                runtime = payload.get("RunTime")
-                # Remove release_year from movie_name if present
-                movie_name = item_name
-                movie_name_cleaned = movie_name.replace(f" ({release_year})", "").strip()
+            movie_id = payload.get("ItemId")
+            overview = payload.get("Overview")
+            runtime = payload.get("RunTime")
 
+            movie_name = item_name
+            movie_name_cleaned = movie_name.replace(f" ({release_year})", "").strip()
+
+            tmdb_id_payload = payload.get("Provider_tmdb") or payload.get("TmdbId")
+            imdb_id_payload = payload.get("Provider_imdb") or payload.get("ImdbId")
+
+            # 1) Сначала проверим апгрейд качества — это должно срабатывать даже если фильм уже «был отправлен»
+            if maybe_notify_movie_quality_change(
+                    item_id=movie_id,
+                    movie_name_cleaned=movie_name_cleaned,
+                    release_year=release_year,
+                    tmdb_id=tmdb_id_payload,
+                    imdb_id=imdb_id_payload,
+                    overview=overview,
+                    runtime=runtime
+            ):
+                return "Movie quality update sent"
+
+            # 2) Иначе — стандартное уведомление о новом фильме (как было)
+            if not item_already_notified(item_type, item_name, release_year):
                 trailer_url = get_youtube_trailer_url(f"{movie_name_cleaned} Trailer {release_year}")
 
                 notification_message = (
                     f"*{t('new_movie_title')}*\n\n*{movie_name_cleaned}* *({release_year})*\n\n{overview}\n\n"
-                    f"*{t('new_runtime')}*\n{runtime}")
+                    f"*{t('new_runtime')}*\n{runtime}"
+                )
 
                 if tmdb_id:
-                    # приводим тип к тому, что ждёт MDblist: movie или series
                     mdblist_type = item_type.lower()
                     ratings_text = fetch_mdblist_ratings(mdblist_type, tmdb_id)
                     if ratings_text:
@@ -1397,12 +1956,16 @@ def announce_new_releases_from_jellyfin():
                 if trailer_url:
                     notification_message += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
 
-#                notification_message_plain = clean_markdown_for_apprise(notification_message)
+                # >>> NEW: приложим список аудио-дорожек
+                media_info = _get_item_media_info_movie(movie_id)  # уже возвращает audio_tracks / count
+                tracks_block = build_audio_tracks_block(media_info)  # "*Аудио-дорожки (N)*\n- ..."
+                if tracks_block:
+                    notification_message += tracks_block
+                # <<< NEW
 
                 send_notification(movie_id, notification_message)
                 mark_item_as_notified(item_type, item_name, release_year)
-                logging.info(f"(Movie) {movie_name} {release_year} "
-                             f"notification was sent.")
+                logging.info(f"(Movie) {movie_name} {release_year} notification was sent.")
                 return "Movie notification was sent"
 
         if item_type == "Season":
