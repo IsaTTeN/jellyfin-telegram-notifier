@@ -1360,7 +1360,6 @@ def mark_item_as_notified(item_type, item_name, release_year, max_items=100):
         notified_items.pop(next(iter(notified_items)))
     save_notified_items(notified_items)
 
-
 @app.route("/webhook", methods=["POST"])
 def announce_new_releases_from_jellyfin():
     try:
