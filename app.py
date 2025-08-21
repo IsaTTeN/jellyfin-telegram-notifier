@@ -85,8 +85,8 @@ DISABLE_DEDUP = os.getenv("NOTIFIER_DISABLE_DEDUP", "1").lower() in ("1", "true"
 MOVIE_POLL_ENABLED = os.getenv("MOVIE_POLL_ENABLED", "1").lower() in ("1", "true", "yes")
 MOVIE_POLL_INTERVAL_SEC = int(os.getenv("MOVIE_POLL_INTERVAL_SEC", "300"))   # каждые 5 минут
 MOVIE_POLL_LIMIT = int(os.getenv("MOVIE_POLL_LIMIT", "200"))                 # смотреть до 200 последних фильмов
-#выключить логику пропуска по датам
-#DEBUG_DISABLE_DATE_CHECKS = True
+#выключить отправку информации о звуковых дорожках
+INCLUDE_AUDIO_TRACKS = os.getenv("INCLUDE_AUDIO_TRACKS", "1").lower() in ("1", "true", "yes", "on")
 # Глобальные переменные
 imgbb_upload_done = threading.Event()   # Сигнал о завершении загрузки
 uploaded_image_url = None               # Здесь хранится ссылка после удачной загрузки
@@ -1813,10 +1813,11 @@ def maybe_notify_movie_quality_change(*, item_id: str, movie_name_cleaned: str, 
     if delta:
         notification_message += delta
 
-    # НОВОЕ: перечислим аудио-дорожки текущего файла
-    tracks_block = build_audio_tracks_block(new_q)
-    if tracks_block:
-        notification_message += tracks_block
+    # ДОБАВЬ УСЛОВИЕ:
+    if INCLUDE_AUDIO_TRACKS:
+        tracks_block = build_audio_tracks_block(new_q)
+        if tracks_block:
+            notification_message += tracks_block
 
     send_notification(item_id, notification_message)
     logging.info(f"(Movie) Quality update sent for {movie_name_cleaned} ({release_year}); logical_key={res.get('logical_key')}")
@@ -1957,10 +1958,12 @@ def announce_new_releases_from_jellyfin():
                     notification_message += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
 
                 # >>> NEW: приложим список аудио-дорожек
-                media_info = _get_item_media_info_movie(movie_id)  # уже возвращает audio_tracks / count
-                tracks_block = build_audio_tracks_block(media_info)  # "*Аудио-дорожки (N)*\n- ..."
-                if tracks_block:
-                    notification_message += tracks_block
+                # >>> список аудио-дорожек показываем только если флаг включён
+                if INCLUDE_AUDIO_TRACKS:
+                    media_info = _get_item_media_info_movie(movie_id)
+                    tracks_block = build_audio_tracks_block(media_info)
+                    if tracks_block:
+                        notification_message += tracks_block
                 # <<< NEW
 
                 send_notification(movie_id, notification_message)
