@@ -223,6 +223,7 @@ MESSAGES = {
         "new_episode_t": "Episode Title",
         "audio_tracks": "Audio tracks",
         "image_profiles": "Image profiles",
+        "quality_updated": "🔼Quality update🔼",
     },
     "ru": {
         "new_movie_title": "🍿Новый фильм добавлен🍿",
@@ -238,6 +239,7 @@ MESSAGES = {
         "new_episode_t": "Название эпизода",
         "audio_tracks": "Аудио-дорожки",
         "image_profiles": "Профили изображения",
+        "quality_updated": "🔼Обновление качества🔼",
     }
 }
 #Выбираем рабочий язык: если заданный отсутствует в MESSAGES — ставим en
@@ -1925,7 +1927,7 @@ def maybe_notify_movie_quality_change(*, item_id: str, movie_name_cleaned: str, 
 
     # Собираем «как при добавлении»
     notification_message = (
-        f"*{t('new_movie_title')}*\n\n*{movie_name_cleaned}* *({release_year})*\n\n{overview or ''}\n\n"
+        f"*{t('quality_updated')}*\n\n*{movie_name_cleaned}* *({release_year})*\n\n{overview or ''}\n\n"
         f"*{t('new_runtime')}*\n{runtime or ''}"
     )
 
