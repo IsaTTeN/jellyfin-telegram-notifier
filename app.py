@@ -83,7 +83,7 @@ SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "")   # ID канала, �
 DISABLE_DEDUP = os.getenv("NOTIFIER_DISABLE_DEDUP", "1").lower() in ("1", "true", "yes")
 #настройки для фильмов
 MOVIE_POLL_ENABLED = os.getenv("MOVIE_POLL_ENABLED", "1").lower() in ("1", "true", "yes")
-MOVIE_POLL_INTERVAL_SEC = int(os.getenv("MOVIE_POLL_INTERVAL_SEC", "300"))   # каждые 5 минут
+MOVIE_POLL_INTERVAL_SEC = int(os.getenv("MOVIE_POLL_INTERVAL_SEC", "80"))   # каждые 5 минут
 MOVIE_POLL_LIMIT = int(os.getenv("MOVIE_POLL_LIMIT", "200"))                 # смотреть до 200 последних фильмов
 #выключить отправку информации о звуковых дорожках
 INCLUDE_AUDIO_TRACKS = os.getenv("INCLUDE_AUDIO_TRACKS", "1").lower() in ("1", "true", "yes", "on")
@@ -155,6 +155,16 @@ def _init_quality_db():
             signature TEXT,
             date_seen TEXT
         )""")
+
+        # --- Мягкая миграция: добавляем колонку image_profiles, если её ещё нет
+        try:
+            cur.execute("ALTER TABLE media_quality ADD COLUMN image_profiles TEXT")
+        except Exception:
+            pass
+        try:
+            cur.execute("ALTER TABLE content_quality ADD COLUMN image_profiles TEXT")
+        except Exception:
+            pass
         conn.commit()
     finally:
         conn.close()
@@ -198,6 +208,7 @@ MESSAGES = {
         "new_series": "Series",
         "new_episode_t": "Episode Title",
         "audio_tracks": "Audio tracks",
+        "image_profiles": "Image profiles",
     },
     "ru": {
         "new_movie_title": "🍿Новый фильм добавлен🍿",
@@ -212,6 +223,7 @@ MESSAGES = {
         "new_series": "Сериал",
         "new_episode_t": "Название эпизода",
         "audio_tracks": "Аудио-дорожки",
+        "image_profiles": "Профили изображения",
     }
 }
 #Выбираем рабочий язык: если заданный отсутствует в MESSAGES — ставим en
@@ -1455,7 +1467,9 @@ def mark_item_as_notified(item_type, item_name, release_year, max_items=100):
 def _get_item_media_info_movie(item_id: str) -> dict:
     """
     Тянем MediaSources/MediaStreams для фильма и уплощаем в dict.
-    Теперь дополнительно возвращаем список аудио-дорожек: audio_tracks + их количество.
+    Дополнительно возвращаем:
+      - список аудио-дорожек: audio_tracks + их количество
+      - профили изображения: image_profiles (['DV','HDR10',...]) и image_profile_str ("DV, HDR10")
     """
     try:
         headers = {'accept': 'application/json'}
@@ -1480,10 +1494,20 @@ def _get_item_media_info_movie(item_id: str) -> dict:
         acodec = None; abitrate = None; channels = None
 
         audio_tracks = []
+        image_profiles = None  # NEW
 
         for s in (src.get("MediaStreams") or []):
             stype = s.get("Type")
             if stype == "Video" and vcodec is None:
+                # ... ваш код извлечения полей ...
+                try:
+                    image_profiles = _detect_image_profiles_from_fields(s)
+                except Exception:
+                    image_profiles = None
+                # >>> ФОЛБЭК
+                if not image_profiles:
+                    image_profiles = ["SDR"]
+                # <<<
                 vcodec = s.get("Codec")
                 vbitrate = s.get("BitRate") or s.get("bitrate") or overall_bitrate
                 width = s.get("Width"); height = s.get("Height")
@@ -1493,6 +1517,13 @@ def _get_item_media_info_movie(item_id: str) -> dict:
                 if isinstance(dyn, str):
                     u = dyn.upper()
                     dyn = "HDR" if ("PQ" in u or "HLG" in u or "HDR" in u or "BT2020" in u) else "SDR"
+
+                # NEW: профили изображения (DV / HDR10+ / HDR10 / HLG / HDR / SDR)
+                try:
+                    image_profiles = _detect_image_profiles_from_fields(s)
+                except Exception:
+                    image_profiles = None
+
             elif stype == "Audio":
                 # основной аудио-снимок (для сводки)
                 if acodec is None:
@@ -1533,9 +1564,12 @@ def _get_item_media_info_movie(item_id: str) -> dict:
             "container": container,
             "size_bytes": size_bytes,
             "duration_sec": duration_sec,
-            # НОВОЕ:
+            # аудио-дорожки
             "audio_tracks": audio_tracks,
             "audio_track_count": len(audio_tracks),
+            # NEW: профили изображения с фолбэком
+            "image_profiles": image_profiles or ["SDR"],
+            "image_profile_str": ", ".join(image_profiles or ["SDR"]),
         }
     except Exception as ex:
         logging.warning(f"Media info fetch failed for movie {item_id}: {ex}")
@@ -1622,6 +1656,9 @@ def store_quality_snapshot_movie(*, item_id: str, name: str, year: int | None,
     sig = _quality_signature(q)
     now = datetime.now().isoformat(timespec='seconds')
 
+    profiles_str = (q.get("image_profile_str") or
+                    ",".join(_profiles_from_q(q)))  # "DV,HDR10" или "SDR"
+
     result = {
         "logical_inserted": False,
         "logical_changed": False,
@@ -1642,66 +1679,119 @@ def store_quality_snapshot_movie(*, item_id: str, name: str, year: int | None,
         cur.execute("SELECT signature FROM media_quality WHERE item_id=?", (item_id,))
         if cur.fetchone() is None:
             cur.execute("""INSERT INTO media_quality
-                (item_id, movie_name, year, video_codec, video_bitrate, width, height, fps, bit_depth, dynamic_range,
-                 audio_codec, audio_bitrate, audio_channels, container, size_bytes, duration_sec, signature, date_seen)
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (item_id, name, year, q.get("video_codec"), q.get("video_bitrate"),
-                 q.get("width"), q.get("height"), q.get("fps"), q.get("bit_depth"), q.get("dynamic_range"),
-                 q.get("audio_codec"), q.get("audio_bitrate"), q.get("audio_channels"),
-                 q.get("container"), q.get("size_bytes"), q.get("duration_sec"), sig, now)
-            )
+                           (item_id, movie_name, year, video_codec, video_bitrate, width, height, fps, bit_depth,
+                            dynamic_range,
+                            audio_codec, audio_bitrate, audio_channels, container, size_bytes, duration_sec, signature,
+                            date_seen, image_profiles)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (item_id, name, year, q.get("video_codec"), q.get("video_bitrate"),
+                         q.get("width"), q.get("height"), q.get("fps"), q.get("bit_depth"), q.get("dynamic_range"),
+                         q.get("audio_codec"), q.get("audio_bitrate"), q.get("audio_channels"),
+                         q.get("container"), q.get("size_bytes"), q.get("duration_sec"), sig, now, profiles_str)
+                        )
         else:
-            cur.execute("""UPDATE media_quality SET
-                 movie_name=?, year=?, video_codec=?, video_bitrate=?, width=?, height=?, fps=?, bit_depth=?,
-                 dynamic_range=?, audio_codec=?, audio_bitrate=?, audio_channels=?, container=?, size_bytes=?,
-                 duration_sec=?, signature=?, date_seen=? WHERE item_id=?""",
-                (name, year, q.get("video_codec"), q.get("video_bitrate"),
-                 q.get("width"), q.get("height"), q.get("fps"), q.get("bit_depth"), q.get("dynamic_range"),
-                 q.get("audio_codec"), q.get("audio_bitrate"), q.get("audio_channels"),
-                 q.get("container"), q.get("size_bytes"), q.get("duration_sec"), sig, now, item_id)
-            )
+            cur.execute("""UPDATE media_quality
+                           SET movie_name=?,
+                               year=?,
+                               video_codec=?,
+                               video_bitrate=?,
+                               width=?,
+                               height=?,
+                               fps=?,
+                               bit_depth=?,
+                               dynamic_range=?,
+                               audio_codec=?,
+                               audio_bitrate=?,
+                               audio_channels=?,
+                               container=?,
+                               size_bytes=?,
+                               duration_sec=?,
+                               signature=?,
+                               date_seen=?,
+                               image_profiles=?
+                           WHERE item_id = ?""",
+                        (name, year, q.get("video_codec"), q.get("video_bitrate"),
+                         q.get("width"), q.get("height"), q.get("fps"), q.get("bit_depth"), q.get("dynamic_range"),
+                         q.get("audio_codec"), q.get("audio_bitrate"), q.get("audio_channels"),
+                         q.get("container"), q.get("size_bytes"), q.get("duration_sec"), sig, now, profiles_str,
+                         item_id)
+                        )
 
         # --- content_quality по logical_key
-        cur.execute("""SELECT signature, last_item_id, video_codec, video_bitrate, width, height, fps, bit_depth,
-                              dynamic_range, audio_codec, audio_bitrate, audio_channels, container, size_bytes, duration_sec
-                       FROM content_quality WHERE logical_key=?""", (logical_key,))
+        cur.execute("""SELECT signature,
+                              last_item_id,
+                              video_codec,
+                              video_bitrate,
+                              width,
+                              height,
+                              fps,
+                              bit_depth,
+                              dynamic_range,
+                              image_profiles,
+                              audio_codec,
+                              audio_bitrate,
+                              audio_channels,
+                              container,
+                              size_bytes,
+                              duration_sec
+                       FROM content_quality
+                       WHERE logical_key = ?""", (logical_key,))
         row = cur.fetchone()
         if row is None:
-            # если снимок «пустой», не считаем это «логической вставкой» — ждём полноценный парс
             if _quality_is_substantial(q):
                 cur.execute("""INSERT INTO content_quality
-                    (logical_key, last_item_id, movie_name, year, video_codec, video_bitrate, width, height, fps, bit_depth,
-                     dynamic_range, audio_codec, audio_bitrate, audio_channels, container, size_bytes, duration_sec, signature, date_seen)
-                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (logical_key, item_id, name, year, q.get("video_codec"), q.get("video_bitrate"),
-                     q.get("width"), q.get("height"), q.get("fps"), q.get("bit_depth"), q.get("dynamic_range"),
-                     q.get("audio_codec"), q.get("audio_bitrate"), q.get("audio_channels"),
-                     q.get("container"), q.get("size_bytes"), q.get("duration_sec"), sig, now)
-                )
+                               (logical_key, last_item_id, movie_name, year, video_codec, video_bitrate, width, height,
+                                fps, bit_depth,
+                                dynamic_range, image_profiles, audio_codec, audio_bitrate, audio_channels, container,
+                                size_bytes, duration_sec, signature, date_seen)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (logical_key, item_id, name, year, q.get("video_codec"), q.get("video_bitrate"),
+                             q.get("width"), q.get("height"), q.get("fps"), q.get("bit_depth"), q.get("dynamic_range"),
+                             profiles_str, q.get("audio_codec"), q.get("audio_bitrate"), q.get("audio_channels"),
+                             q.get("container"), q.get("size_bytes"), q.get("duration_sec"), sig, now)
+                            )
                 result["logical_inserted"] = True
         else:
             old_sig, old_item_id = row[0], row[1]
             old_q = {
                 "video_codec": row[2], "video_bitrate": row[3], "width": row[4], "height": row[5],
                 "fps": row[6], "bit_depth": row[7], "dynamic_range": row[8],
-                "audio_codec": row[9], "audio_bitrate": row[10], "audio_channels": row[11],
-                "container": row[12], "size_bytes": row[13], "duration_sec": row[14]
+                "image_profiles": (row[9].split(",") if row[9] else None),
+                "audio_codec": row[10], "audio_bitrate": row[11], "audio_channels": row[12],
+                "container": row[13], "size_bytes": row[14], "duration_sec": row[15]
             }
             result["old_signature"] = old_sig
             result["old_quality"] = old_q
 
             if old_sig != sig and _quality_is_substantial(old_q) and _quality_is_substantial(q):
                 result["logical_changed"] = True
-                cur.execute("""UPDATE content_quality SET
-                    last_item_id=?, movie_name=?, year=?, video_codec=?, video_bitrate=?, width=?, height=?, fps=?, bit_depth=?,
-                    dynamic_range=?, audio_codec=?, audio_bitrate=?, audio_channels=?, container=?, size_bytes=?, duration_sec=?,
-                    signature=?, date_seen=? WHERE logical_key=?""",
-                    (item_id, name, year, q.get("video_codec"), q.get("video_bitrate"),
-                     q.get("width"), q.get("height"), q.get("fps"), q.get("bit_depth"), q.get("dynamic_range"),
-                     q.get("audio_codec"), q.get("audio_bitrate"), q.get("audio_channels"),
-                     q.get("container"), q.get("size_bytes"), q.get("duration_sec"),
-                     sig, now, logical_key)
-                )
+                cur.execute("""UPDATE content_quality
+                               SET last_item_id=?,
+                                   movie_name=?,
+                                   year=?,
+                                   video_codec=?,
+                                   video_bitrate=?,
+                                   width=?,
+                                   height=?,
+                                   fps=?,
+                                   bit_depth=?,
+                                   dynamic_range=?,
+                                   image_profiles=?,
+                                   audio_codec=?,
+                                   audio_bitrate=?,
+                                   audio_channels=?,
+                                   container=?,
+                                   size_bytes=?,
+                                   duration_sec=?,
+                                   signature=?,
+                                   date_seen=?
+                               WHERE logical_key = ?""",
+                            (item_id, name, year, q.get("video_codec"), q.get("video_bitrate"),
+                             q.get("width"), q.get("height"), q.get("fps"), q.get("bit_depth"), q.get("dynamic_range"),
+                             profiles_str, q.get("audio_codec"), q.get("audio_bitrate"), q.get("audio_channels"),
+                             q.get("container"), q.get("size_bytes"), q.get("duration_sec"),
+                             sig, now, logical_key)
+                            )
         conn.commit()
     finally:
         conn.close()
@@ -1736,11 +1826,12 @@ def build_quality_changes_block(old_q: dict, new_q: dict) -> str:
     L = _labels()
     lines = []
 
-    def arrow(a,b): return f"{a} → {b}"
+    def arrow(a, b):
+        return f"{a} → {b}"
 
     # Разрешение
     def res(q):
-        w,h = q.get("width"), q.get("height")
+        w, h = q.get("width"), q.get("height")
         return f"{w}x{h}" if (w and h) else "-"
     if res(old_q) != res(new_q):
         lines.append(f"- {L['resolution']}: {arrow(res(old_q), res(new_q))}")
@@ -1751,46 +1842,22 @@ def build_quality_changes_block(old_q: dict, new_q: dict) -> str:
     if vc_old != vc_new:
         lines.append(f"- {L['video_codec']}: {arrow(vc_old, vc_new)}")
 
-    # Битрейт
-    if _fmt_mbps(old_q) != _fmt_mbps(new_q):
-        lines.append(f"- {L['bitrate']}: {arrow(_fmt_mbps(old_q), _fmt_mbps(new_q))}")
-
-    # HDR/SDR
+    # Динамический диапазон (SDR/HDR и т.п.)
     dr_old = old_q.get("dynamic_range") or "-"
     dr_new = new_q.get("dynamic_range") or "-"
     if dr_old != dr_new:
         lines.append(f"- {L['dynamic_range']}: {arrow(dr_old, dr_new)}")
 
-    # FPS
-    def fps(q):
-        v = q.get("fps")
-        return f"{float(v):.3f}fps" if isinstance(v, (int,float)) else "-"
-    if fps(old_q) != fps(new_q):
-        lines.append(f"- {L['fps']}: {arrow(fps(old_q), fps(new_q))}")
-
-    # Битовая глубина
-    def bd(q):
-        d = q.get("bit_depth")
-        return f"{d}-bit" if d else "-"
-    if bd(old_q) != bd(new_q):
-        lines.append(f"- {L['bit_depth']}: {arrow(bd(old_q), bd(new_q))}")
-
-    # Аудио (кодек + каналы)
-    def aud(q):
-        c = q.get("audio_channels")
-        return f"{(q.get('audio_codec') or '-').upper()} {c or '-'}ch"
-    if aud(old_q) != aud(new_q):
-        lines.append(f"- {L['audio']}: {arrow(aud(old_q), aud(new_q))}")
-
-    # Контейнер
-    cont_old = (old_q.get("container") or "-").upper()
-    cont_new = (new_q.get("container") or "-").upper()
-    if cont_old != cont_new:
-        lines.append(f"- {L['container']}: {arrow(cont_old, cont_new)}")
-
+    # Профили изображения (SDR/HDR/HDR10/HDR10+/DV/HLG)
+    old_profiles = ", ".join(_profiles_from_q(old_q))
+    new_profiles = ", ".join(_profiles_from_q(new_q))
+    if old_profiles != new_profiles:
+        lines.append(f"- {t('image_profiles')}: {old_profiles} → {new_profiles}")
+    logging.debug(f"Quality delta profiles: old='{old_profiles}' new='{new_profiles}'")
     if not lines:
-        return ""  # ничего существенного
+        return ""
     return f"\n\n*{L['changes']}*\n" + "\n".join(lines)
+
 
 def maybe_notify_movie_quality_change(*, item_id: str, movie_name_cleaned: str, release_year: int | None,
                                       tmdb_id: str | None, imdb_id: str | None,
@@ -1914,6 +1981,86 @@ def poll_recent_movies_once():
                 continue
         except Exception as ex:
             logging.warning(f"Movie poll: item {it.get('Id')} failed: {ex}")
+
+def _detect_image_profiles_from_fields(s: dict) -> list[str]:
+    """
+    Детект DV / HDR10+ / HDR10 / HLG / HDR / SDR по полям видео-потока.
+    Если ничего не нашли — возвращаем ['SDR'].
+    """
+    txt_parts = []
+    for k in ("ColorTransfer","VideoRange","VideoRangeType","ColorPrimaries","ColorSpace",
+              "Profile","Hdr","Hdr10Plus","DolbyVision","DoVi","VideoDoViProfile"):
+        v = s.get(k)
+        if isinstance(v, bool):
+            v = "1" if v else "0"
+        if v is not None:
+            txt_parts.append(str(v))
+    txt = " ".join(txt_parts).upper()
+
+    prof = []
+    def add(tag):
+        if tag not in prof:
+            prof.append(tag)
+
+    if "DOLBY VISION" in txt or "DOVI" in txt or "VIDEO DOVIPROFILE" in txt or re.search(r"\bDV\b", txt or ""):
+        add("DV")
+    if "HDR10+" in txt or "HDR10PLUS" in txt or "HDR10 PLUS" in txt:
+        add("HDR10+")
+    if "HDR10" in txt:
+        add("HDR10")
+    if "HLG" in txt:
+        add("HLG")
+    if ("HDR" in txt or "PQ" in txt or "BT2020" in txt) and not any(p in prof for p in ("DV","HDR10+","HDR10","HLG")):
+        add("HDR")
+    if not prof:
+        add("SDR")
+
+    order = {"DV":0,"HDR10+":1,"HDR10":2,"HLG":3,"HDR":4,"SDR":5}
+    prof.sort(key=lambda x: order.get(x, 99))
+    return prof
+
+def _infer_image_profiles_from_q(q: dict | None) -> list[str]:
+    """
+    Фоллбэк, если старый снимок в БД без подробностей: выводим HDR/SDR по dynamic_range.
+    """
+    if not q: return []
+    dr = (q.get("dynamic_range") or "").upper()
+    if "HDR" in dr:
+        return ["HDR"]
+    return ["SDR"]
+
+def _profiles_from_q(q: dict | None) -> list[str]:
+    """
+    Нормализует список профилей изображения для снимка q.
+    Всегда возвращает минимум ['SDR'].
+    Источники: q['image_profiles'] -> q['dynamic_range'].
+    """
+    order = {"DV": 0, "HDR10+": 1, "HDR10": 2, "HLG": 3, "HDR": 4, "SDR": 5}
+    if not q:
+        return ["SDR"]
+
+    profs = (q.get("image_profiles") or [])
+    if not profs:
+        dr = (q.get("dynamic_range") or "").upper()
+        if "DV" in dr or "DOLBY" in dr:
+            profs = ["DV"]
+        elif "HDR10+" in dr:
+            profs = ["HDR10+"]
+        elif "HDR10" in dr:
+            profs = ["HDR10"]
+        elif "HLG" in dr:
+            profs = ["HLG"]
+        elif "HDR" in dr:
+            profs = ["HDR"]
+        else:
+            profs = ["SDR"]
+
+    profs = [p.upper() for p in profs]
+    profs = list(dict.fromkeys(profs))
+    profs.sort(key=lambda p: order.get(p, 99))
+    return profs
+
+
 
 def _movie_poll_loop():
     while True:
