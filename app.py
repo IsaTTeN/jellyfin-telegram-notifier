@@ -1756,7 +1756,7 @@ def store_quality_snapshot_movie(*, item_id: str, name: str, year: int | None,
             old_q = {
                 "video_codec": row[2], "video_bitrate": row[3], "width": row[4], "height": row[5],
                 "fps": row[6], "bit_depth": row[7], "dynamic_range": row[8],
-                "image_profiles": (row[9].split(",") if row[9] else None),
+                "image_profiles": ([p.strip() for p in row[9].split(",")] if row[9] else None),
                 "audio_codec": row[10], "audio_bitrate": row[11], "audio_channels": row[12],
                 "container": row[13], "size_bytes": row[14], "duration_sec": row[15]
             }
@@ -1857,6 +1857,34 @@ def build_quality_changes_block(old_q: dict, new_q: dict) -> str:
     if not lines:
         return ""
     return f"\n\n*{L['changes']}*\n" + "\n".join(lines)
+
+def build_initial_quality_changes_block(new_q: dict) -> str:
+    """
+    Блок качества для НОВОГО фильма без стрелок и без 'Dynamic range'.
+    Показываем: Resolution, Video codec, Image profiles.
+    """
+    L = _labels()
+    lines = []
+
+    # Resolution
+    w, h = new_q.get("width"), new_q.get("height")
+    res_new = f"{w}x{h}" if (w and h) else "-"
+    if res_new != "-":
+        lines.append(f"- {L['resolution']}: {res_new}")
+
+    # Video codec
+    vc_new = (new_q.get("video_codec") or "-").upper()
+    if vc_new != "-":
+        lines.append(f"- {L['video_codec']}: {vc_new}")
+
+    # Image profiles (SDR/HDR/HDR10/HDR10+/DV/HLG)
+    profiles = ", ".join(_profiles_from_q(new_q))
+    lines.append(f"- {t('image_profiles')}: {profiles}")
+
+    if not lines:
+        return ""
+    return f"\n\n*{L['changes']}*\n" + "\n".join(lines)
+
 
 
 def maybe_notify_movie_quality_change(*, item_id: str, movie_name_cleaned: str, release_year: int | None,
@@ -2030,11 +2058,6 @@ def _infer_image_profiles_from_q(q: dict | None) -> list[str]:
     return ["SDR"]
 
 def _profiles_from_q(q: dict | None) -> list[str]:
-    """
-    Нормализует список профилей изображения для снимка q.
-    Всегда возвращает минимум ['SDR'].
-    Источники: q['image_profiles'] -> q['dynamic_range'].
-    """
     order = {"DV": 0, "HDR10+": 1, "HDR10": 2, "HLG": 3, "HDR": 4, "SDR": 5}
     if not q:
         return ["SDR"]
@@ -2055,10 +2078,13 @@ def _profiles_from_q(q: dict | None) -> list[str]:
         else:
             profs = ["SDR"]
 
-    profs = [p.upper() for p in profs]
+    # ← вот эти две строки ключевые:
+    profs = [str(p).strip().upper() for p in profs if str(p).strip()]
     profs = list(dict.fromkeys(profs))
+
     profs.sort(key=lambda p: order.get(p, 99))
     return profs
+
 
 
 
@@ -2128,14 +2154,73 @@ def announce_new_releases_from_jellyfin():
                 if trailer_url:
                     notification_message += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
 
-                # >>> NEW: приложим список аудио-дорожек
-                # >>> список аудио-дорожек показываем только если флаг включён
-                if INCLUDE_AUDIO_TRACKS:
-                    media_info = _get_item_media_info_movie(movie_id)
-                    tracks_block = build_audio_tracks_block(media_info)
-                    if tracks_block:
-                        notification_message += tracks_block
-                # <<< NEW
+                # --- Quality changes в сообщении о НОВОМ фильме ---
+                try:
+                    # текущее качество
+                    new_q = _get_item_media_info_movie(movie_id)
+
+                    # попробуем найти старый слепок по логическому ключу (если фильм когда-то был)
+                    logical_key = _movie_logical_key(
+                        tmdb_id=tmdb_id_payload,
+                        imdb_id=imdb_id_payload,
+                        name=movie_name_cleaned,
+                        year=release_year
+                    )
+                    old_q = None
+                    try:
+                        conn = sqlite3.connect(QUALITY_DB_FILE)
+                        cur = conn.cursor()
+                        cur.execute("""SELECT video_codec,
+                                              video_bitrate,
+                                              width,
+                                              height,
+                                              fps,
+                                              bit_depth,
+                                              dynamic_range,
+                                              image_profiles,
+                                              audio_codec,
+                                              audio_bitrate,
+                                              audio_channels,
+                                              container,
+                                              size_bytes,
+                                              duration_sec
+                                       FROM content_quality
+                                       WHERE logical_key = ?""", (logical_key,))
+                        row = cur.fetchone()
+                        if row:
+                            old_q = {
+                                "video_codec": row[0], "video_bitrate": row[1], "width": row[2], "height": row[3],
+                                "fps": row[4], "bit_depth": row[5], "dynamic_range": row[6],
+                                "image_profiles": ([p.strip() for p in row[7].split(",")] if row[7] else None),
+                                "audio_codec": row[8], "audio_bitrate": row[9], "audio_channels": row[10],
+                                "container": row[11], "size_bytes": row[12], "duration_sec": row[13],
+                            }
+                    except Exception as ex:
+                        logging.warning(f"Quality (new movie) old snapshot read failed: {ex}")
+                    finally:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+
+                    # Сформируем блок:
+                    delta_block = build_quality_changes_block(old_q,
+                                                              new_q) if old_q else build_initial_quality_changes_block(
+                        new_q)
+                    if not delta_block:
+                        # на всякий случай: если почему-то блок пуст, покажем инициализационный
+                        delta_block = build_initial_quality_changes_block(new_q)
+                    notification_message += delta_block
+
+                    # (по желанию) список аудио-дорожек, если разрешён флагом
+                    if INCLUDE_AUDIO_TRACKS:
+                        tracks_block = build_audio_tracks_block(new_q)
+                        if tracks_block:
+                            notification_message += tracks_block
+
+                except Exception as ex:
+                    logging.warning(f"Quality (new movie) block build failed: {ex}")
+                # --- /Quality changes ---
 
                 send_notification(movie_id, notification_message)
                 mark_item_as_notified(item_type, item_name, release_year)
