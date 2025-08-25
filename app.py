@@ -247,6 +247,30 @@ def _wa_get_jid_from_env():
     local = re.sub(r"\D", "", raw)
     return f"{local}@s.whatsapp.net" if local else None
 
+def jellyfin_get_tmdb_id(item_id: str) -> str | None:
+    """
+    Возвращает TMDB ID для любого элемента Jellyfin по его Id.
+    Читает Items?Ids=...&Fields=ProviderIds и берёт нужный ключ из ProviderIds.
+    """
+    try:
+        params = {
+            "api_key": JELLYFIN_API_KEY,
+            "Ids": item_id,
+            "Fields": "ProviderIds"
+        }
+        url = f"{JELLYFIN_BASE_URL}/emby/Items"
+        r = requests.get(url, params=params, timeout=8)
+        r.raise_for_status()
+        items = (r.json() or {}).get("Items") or []
+        if not items:
+            return None
+        prov = items[0].get("ProviderIds") or {}
+        # разные сервера/версии могут звать ключ по-разному — учтём варианты
+        return prov.get("Tmdb") or prov.get("TmdbId") or prov.get("TMDB") or None
+    except Exception as ex:
+        logging.warning(f"Failed to read ProviderIds for {item_id}: {ex}")
+        return None
+
 
 def fetch_mdblist_ratings(content_type: str, tmdb_id: str) -> str:
     """
@@ -1989,7 +2013,7 @@ def announce_new_releases_from_jellyfin():
                 trailer_url = get_youtube_trailer_url(f"{series_name_cleaned} Trailer {release_year}")
 
                 # Get TMDb ID via external API
-                tmdb_id = get_tmdb_id(series_name_cleaned, release_year)
+                tmdb_id = jellyfin_get_tmdb_id(series_id)
 
                 # **Новые строки**: получаем рейтинги для сериала
                 ratings_text = fetch_mdblist_ratings("show", tmdb_id)
