@@ -17,7 +17,7 @@ from urllib.parse import quote
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from logging.handlers import TimedRotatingFileHandler
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import sqlite3
 
 load_dotenv()
@@ -87,6 +87,8 @@ MOVIE_POLL_INTERVAL_SEC = int(os.getenv("MOVIE_POLL_INTERVAL_SEC", "80"))   # к
 MOVIE_POLL_LIMIT = int(os.getenv("MOVIE_POLL_LIMIT", "200"))                 # смотреть до 200 последних фильмов
 #выключить отправку информации о звуковых дорожках
 INCLUDE_AUDIO_TRACKS = os.getenv("INCLUDE_AUDIO_TRACKS", "1").lower() in ("1", "true", "yes", "on")
+#подавление дублирующих сообщение webhook если это былдо обновление контента
+SUPPRESS_WEBHOOK_AFTER_QUALITY_UPDATE_MIN = int(os.getenv("SUPPRESS_WEBHOOK_AFTER_QUALITY_UPDATE_MIN", "60"))  # по умолчанию 60 минут
 # Глобальные переменные
 imgbb_upload_done = threading.Event()   # Сигнал о завершении загрузки
 uploaded_image_url = None               # Здесь хранится ссылка после удачной загрузки
@@ -155,7 +157,19 @@ def _init_quality_db():
             signature TEXT,
             date_seen TEXT
         )""")
-
+        cur.execute("""
+                    CREATE TABLE IF NOT EXISTS recent_quality_updates
+                    (
+                        logical_key
+                        TEXT
+                        PRIMARY
+                        KEY,
+                        notified_at
+                        TEXT,
+                        item_id
+                        TEXT
+                    )
+                    """)
         # --- Мягкая миграция: добавляем колонку image_profiles, если её ещё нет
         try:
             cur.execute("ALTER TABLE media_quality ADD COLUMN image_profiles TEXT")
@@ -1939,6 +1953,9 @@ def maybe_notify_movie_quality_change(*, item_id: str, movie_name_cleaned: str, 
             notification_message += tracks_block
 
     send_notification(item_id, notification_message)
+    touch_quality_update_marker(res.get("logical_key") or _movie_logical_key(
+        tmdb_id=tmdb_id, imdb_id=imdb_id, name=movie_name_cleaned, year=release_year
+    ), item_id=item_id)
     logging.info(f"(Movie) Quality update sent for {movie_name_cleaned} ({release_year}); logical_key={res.get('logical_key')}")
     return True
 
@@ -2085,7 +2102,52 @@ def _profiles_from_q(q: dict | None) -> list[str]:
     profs.sort(key=lambda p: order.get(p, 99))
     return profs
 
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
 
+def _iso_to_dt(s: str | None) -> datetime | None:
+    if not s: return None
+    try:
+        return datetime.fromisoformat(s.replace('Z', '+00:00'))
+    except Exception:
+        return None
+
+def touch_quality_update_marker(logical_key: str, item_id: str | None = None):
+    try:
+        conn = sqlite3.connect(QUALITY_DB_FILE)
+        cur = conn.cursor()
+        cur.execute("""INSERT INTO recent_quality_updates (logical_key, notified_at, item_id)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(logical_key) DO UPDATE SET
+                         notified_at=excluded.notified_at,
+                         item_id=excluded.item_id
+                    """, (logical_key, _now_utc_iso(), item_id))
+        conn.commit()
+    except Exception as ex:
+        logging.warning(f"touch_quality_update_marker failed: {ex}")
+    finally:
+        try: conn.close()
+        except: pass
+
+def was_quality_update_recent(logical_key: str) -> bool:
+    try:
+        conn = sqlite3.connect(QUALITY_DB_FILE)
+        cur = conn.cursor()
+        cur.execute("SELECT notified_at FROM recent_quality_updates WHERE logical_key=?", (logical_key,))
+        row = cur.fetchone()
+    except Exception as ex:
+        logging.warning(f"was_quality_update_recent check failed: {ex}")
+        return False
+    finally:
+        try: conn.close()
+        except: pass
+
+    if not row:
+        return False
+    ts = _iso_to_dt(row[0])
+    if not ts:
+        return False
+    return (datetime.now(timezone.utc) - ts) < timedelta(minutes=SUPPRESS_WEBHOOK_AFTER_QUALITY_UPDATE_MIN)
 
 
 def _movie_poll_loop():
@@ -2123,6 +2185,14 @@ def announce_new_releases_from_jellyfin():
 
             tmdb_id_payload = payload.get("Provider_tmdb") or payload.get("TmdbId")
             imdb_id_payload = payload.get("Provider_imdb") or payload.get("ImdbId")
+
+            # --- НОВОЕ: если недавно отправляли quality-update по сканеру/гварду — глушим вебхук
+            logical_key = _movie_logical_key(tmdb_id=tmdb_id_payload, imdb_id=imdb_id_payload,
+                                             name=movie_name_cleaned, year=release_year)
+            if was_quality_update_recent(logical_key):
+                logging.info(
+                    f"(Webhook/Movie) Suppressed 'new movie' due to recent quality update (logical_key={logical_key})")
+                return "Suppressed: recent quality update"
 
             # 1) Сначала проверим апгрейд качества — это должно срабатывать даже если фильм уже «был отправлен»
             if maybe_notify_movie_quality_change(
