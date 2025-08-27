@@ -84,7 +84,6 @@ DISABLE_DEDUP = os.getenv("NOTIFIER_DISABLE_DEDUP", "1").lower() in ("1", "true"
 #настройки для фильмов
 MOVIE_POLL_ENABLED = os.getenv("MOVIE_POLL_ENABLED", "1").lower() in ("1", "true", "yes")
 MOVIE_POLL_INTERVAL_SEC = int(os.getenv("MOVIE_POLL_INTERVAL_SEC", "80"))   # каждые 5 минут
-MOVIE_POLL_LIMIT = int(os.getenv("MOVIE_POLL_LIMIT", "200"))                 # смотреть до 200 последних фильмов
 MOVIE_POLL_GRACE_MIN = int(os.getenv("MOVIE_POLL_GRACE_MIN", "45"))  # не трогать фильмы, созданные за последние N минут
 MOVIE_POLL_PAGE_SIZE = int(os.getenv("MOVIE_POLL_PAGE_SIZE", "500"))  # сколько брать за 1 запрос
 MOVIE_POLL_MAX_TOTAL = int(os.getenv("MOVIE_POLL_MAX_TOTAL", "0"))    # 0 = не ограничивать общее число
@@ -1983,8 +1982,7 @@ def poll_recent_movies_once():
     """
     page_size = MOVIE_POLL_PAGE_SIZE
     # совместимость: если задан старый MOVIE_POLL_LIMIT и MAX_TOTAL == 0, используем его как предел
-    legacy_limit = MOVIE_POLL_LIMIT if 'MOVIE_POLL_LIMIT' in globals() else 0
-    max_total = MOVIE_POLL_MAX_TOTAL or legacy_limit or 0  # 0 = без ограничения
+    max_total = MOVIE_POLL_MAX_TOTAL  # 0 = без ограничения
 
     start = 0
     fetched = 0
@@ -2215,7 +2213,7 @@ def _movie_poll_loop():
 
 if MOVIE_POLL_ENABLED:
     threading.Thread(target=_movie_poll_loop, name="movie-poll", daemon=True).start()
-    logging.info(f"Movie quality polling enabled every {MOVIE_POLL_INTERVAL_SEC}s (limit={MOVIE_POLL_LIMIT})")
+    logging.info(f"Movie quality polling enabled every {MOVIE_POLL_INTERVAL_SEC}s (limit={MOVIE_POLL_MAX_TOTAL})")
 
 
 @app.route("/webhook", methods=["POST"])
