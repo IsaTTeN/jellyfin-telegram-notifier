@@ -332,31 +332,6 @@ def fetch_mdblist_ratings(content_type: str, tmdb_id: str) -> str:
         app.logger.warning(f"MDblist API error for {content_type}/{tmdb_id}: {e}")
         return ""
 
-def get_tmdb_id(series_name: str, release_year: int) -> str:
-    """
-    Поиск сериала в TMDb и возврат первого найденного TV ID.
-    Если ничего не найдено — возвращает "N/A".
-    """
-    params = {
-        "api_key": TMDB_API_KEY,
-        "query": series_name,
-        "first_air_date_year": release_year,
-        "language": "en-US",
-        "page": 1
-    }
-    try:
-        resp = requests.get(TMDB_SEARCH_URL, params=params)
-        resp.raise_for_status()
-        data = resp.json()
-        results = data.get("results", [])
-        if not results:
-            logging.warning(f"TMDb: не найден сериал «{series_name} ({release_year})»")
-            return "N/A"
-        return str(results[0]["id"])
-    except requests.RequestException as e:
-        logging.error(f"Ошибка при запросе TMDb для «{series_name}»: {e}")
-        return "N/A"
-
 def upload_image_to_imgbb(image_bytes):
     """
     Загружает изображение на imgbb.com (до 3 попыток) и устанавливает событие по завершении.
@@ -1140,87 +1115,6 @@ def _matrix_send_event_rest(room_id: str, event_type: str, content: dict):
         logging.warning(f"Matrix send event failed: {ex}")
         return None
 
-
-#def send_matrix_image_from_imgbb(photo_id: str, caption_markdown: str, uploaded_url: str | None = None):
-#    """
-#    Отправляет В MATRIX изображение, которое было загружено на imgbb:
-#      1) ждём готовности imgbb (если uploaded_url не передан) -> берём HTTP-URL
-#      2) скачиваем картинку с imgbb
-#      3) загружаем в Matrix media-repo (получаем mxc://…)
-#      4) отправляем m.image с подписью в body
-#    Возвращает response или None.
-#    """
-#    # 1) Берём URL из imgbb
-#    try:
-#        img_http_url = uploaded_url or wait_for_imgbb_upload()
-#        if not img_http_url:
-#            logging.warning("Matrix image: imgbb URL is empty; skip.")
-#            return None
-#    except Exception as ex:
-#        logging.warning(f"Matrix image: waiting imgbb failed: {ex}")
-#        return None
-
-    # 2) Скачиваем картинку с imgbb
-#    try:
-#        r = requests.get(img_http_url, timeout=30)
-#        r.raise_for_status()
-#        image_bytes = r.content
-#        mimetype = r.headers.get("Content-Type", "image/jpeg").split(";")[0].strip().lower()
-#        ext = ".jpg"
-#        if "png" in mimetype: ext = ".png"
-#        elif "webp" in mimetype: ext = ".webp"
-#        filename = f"poster{ext}"
-#    except Exception as ex:
-#        logging.warning(f"Matrix image: cannot download from imgbb: {ex}")
-#        return None
-
-    # 3) Загружаем в Matrix → получаем mxc://
-#    mxc = matrix_upload_image_rest(image_bytes, filename, mimetype)
-#    if not mxc:
-#        return None
-
-    # 👇 ВАЖНО: body = ИМЯ ФАЙЛА, НЕ caption
-#   content = {
-#        "msgtype": "m.image",
-#        "body": filename,     # <-- раньше здесь был caption; поменяли на имя файла
-#        "url": mxc,
-#        "info": {
-#            "mimetype": mimetype,
-#            "size": len(image_bytes),
-#        },
-#    }
-#    return _matrix_send_event_rest(MATRIX_ROOM_ID, "m.room.message", content)
-
-
-#def send_matrix_image_then_text_from_imgbb(photo_id: str, caption_markdown: str, uploaded_url: str | None = None) -> bool:
-#    """
-#    Сначала отправляет в Matrix изображение (берём именно то, что лежит на imgbb),
-#    затем отдельным сообщением отправляет текст (используем send_matrix_text_rest).
-#    """
-#    img_ok = False
-#    try:
-#        r_img = send_matrix_image_from_imgbb(photo_id, caption_markdown, uploaded_url=uploaded_url)
-#        if r_img and r_img.ok:
-#            img_ok = True
-#            logging.info("Matrix: image (from imgbb) sent successfully.")
-#        else:
-#            logging.warning("Matrix: image (from imgbb) failed to send.")
-#    except Exception as ex:
-#        logging.warning(f"Matrix: image-from-imgbb pipeline failed: {ex}")
-
-#    txt_ok = False
-#    try:
-#        r_txt = send_matrix_text_rest(caption_markdown)
-#        if r_txt and r_txt.ok:
-#            txt_ok = True
-#            logging.info("Matrix: text sent successfully after image.")
-#        else:
-#            logging.warning("Matrix: text failed to send after image.")
-#    except Exception as ex:
-#       logging.warning(f"Matrix: text pipeline failed: {ex}")
-
-#    return img_ok and txt_ok
-
 def _fetch_jellyfin_primary(photo_id: str):
     """
     Возвращает (bytes, mimetype, filename) для Primary-постера из Jellyfin.
@@ -1639,21 +1533,6 @@ def _fmt_mbps(q: dict) -> str:
         except: return f"{vbr} kbps"
     kbps = q.get("approx_video_kbps")
     return f"{kbps/1000:.1f} Mbps (≈)" if kbps else "-"
-
-def _format_quality_human(q: dict) -> str:
-    if not q: return "unknown"
-    w,h = q.get("width"), q.get("height")
-    res = f"{w}x{h}" if (w and h) else "-"
-    vcodec = (q.get("video_codec") or "-").upper()
-    acodec = (q.get("audio_codec") or "-").upper()
-    dr = q.get("dynamic_range") or "-"
-    ch = q.get("audio_channels") or "-"
-    cont = (q.get("container") or "-").upper()
-    fps = q.get("fps")
-    fps_str = f" {float(fps):.3f}fps" if isinstance(fps, (int, float)) else ""
-    bd = q.get("bit_depth")
-    bd_str = f" {bd}-bit" if bd else ""
-    return f"{res} {vcodec}{bd_str} {dr}{fps_str} | {acodec} {ch}ch | {cont} | {_fmt_mbps(q)}"
 
 def _movie_logical_key(*, tmdb_id: str | None, imdb_id: str | None, name: str, year: int | None) -> str:
     if tmdb_id: return f"movie:tmdb:{tmdb_id}"
@@ -2108,16 +1987,6 @@ def _detect_image_profiles_from_fields(s: dict) -> list[str]:
     order = {"DV":0,"HDR10+":1,"HDR10":2,"HLG":3,"HDR":4,"SDR":5}
     prof.sort(key=lambda x: order.get(x, 99))
     return prof
-
-def _infer_image_profiles_from_q(q: dict | None) -> list[str]:
-    """
-    Фоллбэк, если старый снимок в БД без подробностей: выводим HDR/SDR по dynamic_range.
-    """
-    if not q: return []
-    dr = (q.get("dynamic_range") or "").upper()
-    if "HDR" in dr:
-        return ["HDR"]
-    return ["SDR"]
 
 def _profiles_from_q(q: dict | None) -> list[str]:
     order = {"DV": 0, "HDR10+": 1, "HDR10": 2, "HLG": 3, "HDR": 4, "SDR": 5}
