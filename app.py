@@ -85,6 +85,9 @@ DISABLE_DEDUP = os.getenv("NOTIFIER_DISABLE_DEDUP", "1").lower() in ("1", "true"
 MOVIE_POLL_ENABLED = os.getenv("MOVIE_POLL_ENABLED", "1").lower() in ("1", "true", "yes")
 MOVIE_POLL_INTERVAL_SEC = int(os.getenv("MOVIE_POLL_INTERVAL_SEC", "80"))   # каждые 5 минут
 MOVIE_POLL_LIMIT = int(os.getenv("MOVIE_POLL_LIMIT", "200"))                 # смотреть до 200 последних фильмов
+MOVIE_POLL_GRACE_MIN = int(os.getenv("MOVIE_POLL_GRACE_MIN", "45"))  # не трогать фильмы, созданные за последние N минут
+MOVIE_POLL_PAGE_SIZE = int(os.getenv("MOVIE_POLL_PAGE_SIZE", "500"))  # сколько брать за 1 запрос
+MOVIE_POLL_MAX_TOTAL = int(os.getenv("MOVIE_POLL_MAX_TOTAL", "0"))    # 0 = не ограничивать общее число
 #выключить отправку информации о звуковых дорожках
 INCLUDE_AUDIO_TRACKS = os.getenv("INCLUDE_AUDIO_TRACKS", "1").lower() in ("1", "true", "yes", "on")
 #подавление дублирующих сообщение webhook если это былдо обновление контента
@@ -1975,59 +1978,101 @@ def _format_runtime_from_ticks(runtime_ticks) -> str:
         return ""
 def poll_recent_movies_once():
     """
-    Тянем последние изменённые/добавленные фильмы и проверяем, не выросло ли качество.
-    При изменении качества шлём уведомление тем же шаблоном, дополняя блоком 'Изменения качества'.
+    Пагинированно тянем фильмы и проверяем апгрейды качества.
+    Новые (очень свежие) пропускаем — их объявит вебхук.
     """
-    try:
-        params = {
-            "api_key": JELLYFIN_API_KEY,
-            "IncludeItemTypes": "Movie",
-            "Recursive": "true",
-            "SortBy": "DateModified,DateCreated",
-            "SortOrder": "Descending",
-            "Limit": str(MOVIE_POLL_LIMIT),
-            # Overview и RunTimeTicks понадобятся для текста
-            "Fields": "MediaSources,RunTimeTicks,ProviderIds,ProductionYear,Overview"
-        }
-        url = f"{JELLYFIN_BASE_URL}/emby/Items"
-        r = requests.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        items = (r.json() or {}).get("Items") or []
-    except Exception as ex:
-        logging.warning(f"Movie poll: failed to load recent items: {ex}")
-        return
+    page_size = MOVIE_POLL_PAGE_SIZE
+    # совместимость: если задан старый MOVIE_POLL_LIMIT и MAX_TOTAL == 0, используем его как предел
+    legacy_limit = MOVIE_POLL_LIMIT if 'MOVIE_POLL_LIMIT' in globals() else 0
+    max_total = MOVIE_POLL_MAX_TOTAL or legacy_limit or 0  # 0 = без ограничения
 
-    for it in items:
+    start = 0
+    fetched = 0
+    now_utc = datetime.now(timezone.utc)
+
+    while True:
+        # Ограничение на последнюю страницу, если нужно
+        current_limit = page_size
+        if max_total and (max_total - fetched) < page_size:
+            current_limit = max_total - fetched
+            if current_limit <= 0:
+                break
+
         try:
-            item_id = it.get("Id")
-            name = it.get("Name") or ""
-            year = it.get("ProductionYear")
-            prov = it.get("ProviderIds") or {}
-            tmdb_id = prov.get("Tmdb") or prov.get("TmdbId")
-            imdb_id = prov.get("Imdb") or prov.get("ImdbId")
-
-            # Имя без года в скобках (как в вебхуке)
-            name_clean = name.replace(f" ({year})", "").strip()
-
-            # Overview/Runtime для шаблона
-            overview = it.get("Overview") or ""
-            runtime_str = _format_runtime_from_ticks(it.get("RunTimeTicks"))
-
-            # Используем уже написанный пред-гвард для фильмов
-            sent = maybe_notify_movie_quality_change(
-                item_id=item_id,
-                movie_name_cleaned=name_clean,
-                release_year=year,
-                tmdb_id=tmdb_id,
-                imdb_id=imdb_id,
-                overview=overview,
-                runtime=runtime_str
-            )
-            if sent:
-                # первая же отправка обновит запись в БД, на следующем проходе повторов не будет
-                continue
+            params = {
+                "api_key": JELLYFIN_API_KEY,
+                "IncludeItemTypes": "Movie",
+                "Recursive": "true",
+                "SortBy": "DateModified,DateCreated",
+                "SortOrder": "Descending",
+                "Limit": str(current_limit),
+                "StartIndex": str(start),
+                # DateCreated нужен для грейс-фильтра (чтобы вебхук объявлял «новые»)
+                "Fields": "MediaSources,RunTimeTicks,ProviderIds,ProductionYear,Overview,DateCreated"
+            }
+            url = f"{JELLYFIN_BASE_URL}/emby/Items"
+            r = requests.get(url, params=params, timeout=20)
+            r.raise_for_status()
+            payload = r.json() or {}
+            items = payload.get("Items") or []
         except Exception as ex:
-            logging.warning(f"Movie poll: item {it.get('Id')} failed: {ex}")
+            logging.warning(f"Movie poll: failed page start={start}: {ex}")
+            break
+
+        if not items:
+            break
+
+        for it in items:
+            try:
+                # --- грейс: свежие новинки не трогаем (пусть вебхук пошлёт 'New Movie Added')
+                created_iso = it.get("DateCreated")
+                created_dt = _parse_iso_utc(created_iso)
+                if created_dt and (now_utc - created_dt) < timedelta(minutes=MOVIE_POLL_GRACE_MIN):
+                    logging.debug(f"Movie poll: skip fresh item (created {created_dt.isoformat()}): {it.get('Name')}")
+                    continue
+                # -------------------------------------------------------------
+
+                item_id = it.get("Id")
+                name = it.get("Name") or ""
+                year = it.get("ProductionYear")
+                prov = it.get("ProviderIds") or {}
+                tmdb_id = prov.get("Tmdb") or prov.get("TmdbId")
+                imdb_id = prov.get("Imdb") or prov.get("ImdbId")
+
+                # Имя без года в скобках (как в вебхуке)
+                name_clean = name.replace(f" ({year})", "").strip()
+
+                # Overview/Runtime для текста
+                overview = it.get("Overview") or ""
+                runtime_str = _format_runtime_from_ticks(it.get("RunTimeTicks"))
+
+                # Проверяем и отправляем ТОЛЬКО апдейты качества (не «новый фильм»)
+                sent = maybe_notify_movie_quality_change(
+                    item_id=item_id,
+                    movie_name_cleaned=name_clean,
+                    release_year=year,
+                    tmdb_id=tmdb_id,
+                    imdb_id=imdb_id,
+                    overview=overview,
+                    runtime=runtime_str
+                )
+                if sent:
+                    # запись в БД уже обновлена; повтора на следующем проходе не будет
+                    continue
+            except Exception as ex:
+                logging.warning(f"Movie poll: item {it.get('Id')} failed: {ex}")
+
+        n = len(items)
+        fetched += n
+        start += n
+        logging.debug(f"Movie poll: page fetched {n} items (total {fetched})")
+
+        # если страница неполная — дальше элементов нет
+        if n < current_limit:
+            break
+
+        # мягкое дыхание между страницами (не обязательно)
+        time.sleep(0.1)
 
 def _detect_image_profiles_from_fields(s: dict) -> list[str]:
     """
@@ -2150,6 +2195,14 @@ def was_quality_update_recent(logical_key: str) -> bool:
     if not ts:
         return False
     return (datetime.now(timezone.utc) - ts) < timedelta(minutes=SUPPRESS_WEBHOOK_AFTER_QUALITY_UPDATE_MIN)
+
+def _parse_iso_utc(s: str | None):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(timezone.utc)
+    except Exception:
+        return None
 
 
 def _movie_poll_loop():
