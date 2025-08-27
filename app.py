@@ -1727,11 +1727,11 @@ def build_quality_changes_block(old_q: dict, new_q: dict) -> str:
         return f"{a} → {b}"
 
     # Разрешение
-    def res(q):
-        w, h = q.get("width"), q.get("height")
-        return f"{w}x{h}" if (w and h) else "-"
-    if res(old_q) != res(new_q):
-        lines.append(f"- {L['resolution']}: {arrow(res(old_q), res(new_q))}")
+    # --- Resolution (с ярлыками) ---
+    res_old = _res_display_from_q(old_q)
+    res_new = _res_display_from_q(new_q)
+    if res_old != res_new:
+        lines.append(f"- {L['resolution']}: {arrow(res_old, res_new)}")
 
     # Видео-кодек
     vc_old = (old_q.get("video_codec") or "-").upper()
@@ -1764,8 +1764,8 @@ def build_initial_quality_changes_block(new_q: dict) -> str:
     lines = []
 
     # Resolution
-    w, h = new_q.get("width"), new_q.get("height")
-    res_new = f"{w}x{h}" if (w and h) else "-"
+    # Resolution -> ярлык (или WxH при неизвестном)
+    res_new = _res_display_from_q(new_q)
     if res_new != "-":
         lines.append(f"- {L['resolution']}: {res_new}")
 
@@ -2083,6 +2083,50 @@ def _movie_poll_loop():
 if MOVIE_POLL_ENABLED:
     threading.Thread(target=_movie_poll_loop, name="movie-poll", daemon=True).start()
     logging.info(f"Movie quality polling enabled every {MOVIE_POLL_INTERVAL_SEC}s (limit={MOVIE_POLL_MAX_TOTAL})")
+
+def _resolution_label(width: int | None, height: int | None) -> str | None:
+    """
+    Возвращает текстовый ярлык разрешения (8K, 5K, 4K (UltraHD), 1440p, 1080p, 720p, 576p, 480p, 360p, 240p).
+    Использует высоту кадра с допуском (~8%) на «неканонические» значения (например, 2026 ≈ 2160).
+    Если не попадает ни в один диапазон — вернёт None.
+    """
+    if not height:
+        return None
+
+    # (target_height, label)
+    targets = [
+        (4320, "8K"),
+        (2880, "5K"),
+        (2160, "4K (UltraHD)"),
+        (1440, "1440p"),
+        (1080, "1080p"),
+        (720,  "720p"),
+        (576,  "576p"),
+        (480,  "480p"),
+        (360,  "360p"),
+        (240,  "240p"),
+    ]
+    for h, label in targets:
+        tol = max(int(h * 0.08), 12)  # ~8% или минимум 12px
+        if abs(height - h) <= tol:
+            return label
+    return None
+
+def _res_display_from_q(q: dict | None) -> str:
+    """
+    Человекочитаемое разрешение для отображения:
+    - если удалось сопоставить ярлык 8K/4K/... -> вернуть его
+    - иначе вернуть 'WxH'
+    - если данных нет -> '-'
+    """
+    if not q:
+        return "-"
+    w, h = q.get("width"), q.get("height")
+    if not (w and h):
+        return "-"
+    label = _resolution_label(w, h)
+    return label or f"{w}x{h}"
+
 
 
 @app.route("/webhook", methods=["POST"])
