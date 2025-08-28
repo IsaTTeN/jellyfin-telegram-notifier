@@ -95,6 +95,7 @@ QUALITY_GC_PAGE_SIZE = int(os.getenv("QUALITY_GC_PAGE_SIZE", "500"))            
 # Форсированная одноразовая очистка БД качества при старте
 FORCE_QUALITY_GC_ON_START = os.getenv("FORCE_QUALITY_GC_ON_START", "0").lower() in ("1","true","yes","on")
 # Необязательное переопределение grace-срока именно для форс-запуска (по умолчанию 0 = удалять сразу)
+
 FORCE_QUALITY_GC_GRACE_DAYS = os.getenv("FORCE_QUALITY_GC_GRACE_DAYS")
 # Сжать БД после очистки
 FORCE_QUALITY_GC_VACUUM = os.getenv("FORCE_QUALITY_GC_VACUUM", "0").lower() in ("1","true","yes","on")
