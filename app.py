@@ -87,6 +87,17 @@ MOVIE_POLL_INTERVAL_SEC = int(os.getenv("MOVIE_POLL_INTERVAL_SEC", "80"))   # к
 MOVIE_POLL_GRACE_MIN = int(os.getenv("MOVIE_POLL_GRACE_MIN", "45"))  # не трогать фильмы, созданные за последние N минут
 MOVIE_POLL_PAGE_SIZE = int(os.getenv("MOVIE_POLL_PAGE_SIZE", "500"))  # сколько брать за 1 запрос
 MOVIE_POLL_MAX_TOTAL = int(os.getenv("MOVIE_POLL_MAX_TOTAL", "0"))    # 0 = не ограничивать общее число
+# GC БД качества
+QUALITY_GC_ENABLED = os.getenv("QUALITY_GC_ENABLED", "1").lower() in ("1","true","yes","on")
+QUALITY_GC_INTERVAL_HOURS = int(os.getenv("QUALITY_GC_INTERVAL_HOURS", "24"))   # как часто чистить
+QUALITY_GC_GRACE_DAYS = int(os.getenv("QUALITY_GC_GRACE_DAYS", "1"))            # не трогать записи моложе N дней
+QUALITY_GC_PAGE_SIZE = int(os.getenv("QUALITY_GC_PAGE_SIZE", "500"))            # сколько фильмов за раз тянуть из Jellyfin
+# Форсированная одноразовая очистка БД качества при старте
+FORCE_QUALITY_GC_ON_START = os.getenv("FORCE_QUALITY_GC_ON_START", "0").lower() in ("1","true","yes","on")
+# Необязательное переопределение grace-срока именно для форс-запуска (по умолчанию 0 = удалять сразу)
+FORCE_QUALITY_GC_GRACE_DAYS = os.getenv("FORCE_QUALITY_GC_GRACE_DAYS")
+# Сжать БД после очистки
+FORCE_QUALITY_GC_VACUUM = os.getenv("FORCE_QUALITY_GC_VACUUM", "0").lower() in ("1","true","yes","on")
 #выключить отправку информации о звуковых дорожках
 INCLUDE_AUDIO_TRACKS = os.getenv("INCLUDE_AUDIO_TRACKS", "1").lower() in ("1", "true", "yes", "on")
 #подавление дублирующих сообщение webhook если это былдо обновление контента
@@ -2126,6 +2137,231 @@ def _res_display_from_q(q: dict | None) -> str:
         return "-"
     label = _resolution_label(w, h)
     return label or f"{w}x{h}"
+
+#Очистка базы данных
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec='seconds').replace("+00:00", "Z")
+
+def _iso_to_dt(s: str | None) -> datetime | None:
+    if not s: return None
+    try: return datetime.fromisoformat(s.replace("Z","+00:00")).astimezone(timezone.utc)
+    except Exception: return None
+
+def _collect_current_movie_keys_and_ids() -> tuple[set[str], set[str]]:
+    """
+    Возвращает (set логических ключей, set ItemId) для ВСЕХ фильмов в Jellyfin.
+    Ключ строим через _movie_logical_key(...) по ProviderIds/Tmdb/Imdb -> name+year.
+    """
+    current_keys: set[str] = set()
+    current_ids: set[str] = set()
+
+    start = 0
+    page_size = QUALITY_GC_PAGE_SIZE
+
+    while True:
+        try:
+            params = {
+                "api_key": JELLYFIN_API_KEY,
+                "IncludeItemTypes": "Movie",
+                "Recursive": "true",
+                "SortBy": "DateCreated",
+                "SortOrder": "Descending",
+                "Limit": str(page_size),
+                "StartIndex": str(start),
+                "Fields": "ProviderIds,ProductionYear"
+            }
+            url = f"{JELLYFIN_BASE_URL}/emby/Items"
+            r = requests.get(url, params=params, timeout=20)
+            r.raise_for_status()
+            payload = r.json() or {}
+            items = payload.get("Items") or []
+        except Exception as ex:
+            logging.warning(f"Quality GC: failed to list movies page start={start}: {ex}")
+            break
+
+        if not items:
+            break
+
+        for it in items:
+            item_id = it.get("Id")
+            name = it.get("Name") or ""
+            year = it.get("ProductionYear")
+            prov = it.get("ProviderIds") or {}
+            tmdb_id = prov.get("Tmdb") or prov.get("TmdbId")
+            imdb_id = prov.get("Imdb") or prov.get("ImdbId")
+            # имя без суффикса "(year)"
+            name_clean = name.replace(f" ({year})", "").strip()
+
+            key = _movie_logical_key(
+                tmdb_id=tmdb_id,
+                imdb_id=imdb_id,
+                name=name_clean,
+                year=year
+            )
+            current_keys.add(key)
+            if item_id:
+                current_ids.add(item_id)
+
+        n = len(items)
+        start += n
+        if n < page_size:
+            break
+
+    return current_keys, current_ids
+
+def _collect_current_movie_keys_and_ids() -> tuple[set[str], set[str]]:
+    """
+    Возвращает (set логических ключей, set ItemId) для ВСЕХ фильмов в Jellyfin.
+    Ключ строим через _movie_logical_key(...) по ProviderIds/Tmdb/Imdb -> name+year.
+    """
+    current_keys: set[str] = set()
+    current_ids: set[str] = set()
+
+    start = 0
+    page_size = QUALITY_GC_PAGE_SIZE
+
+    while True:
+        try:
+            params = {
+                "api_key": JELLYFIN_API_KEY,
+                "IncludeItemTypes": "Movie",
+                "Recursive": "true",
+                "SortBy": "DateCreated",
+                "SortOrder": "Descending",
+                "Limit": str(page_size),
+                "StartIndex": str(start),
+                "Fields": "ProviderIds,ProductionYear"
+            }
+            url = f"{JELLYFIN_BASE_URL}/emby/Items"
+            r = requests.get(url, params=params, timeout=20)
+            r.raise_for_status()
+            payload = r.json() or {}
+            items = payload.get("Items") or []
+        except Exception as ex:
+            logging.warning(f"Quality GC: failed to list movies page start={start}: {ex}")
+            break
+
+        if not items:
+            break
+
+        for it in items:
+            item_id = it.get("Id")
+            name = it.get("Name") or ""
+            year = it.get("ProductionYear")
+            prov = it.get("ProviderIds") or {}
+            tmdb_id = prov.get("Tmdb") or prov.get("TmdbId")
+            imdb_id = prov.get("Imdb") or prov.get("ImdbId")
+            # имя без суффикса "(year)"
+            name_clean = name.replace(f" ({year})", "").strip()
+
+            key = _movie_logical_key(
+                tmdb_id=tmdb_id,
+                imdb_id=imdb_id,
+                name=name_clean,
+                year=year
+            )
+            current_keys.add(key)
+            if item_id:
+                current_ids.add(item_id)
+
+        n = len(items)
+        start += n
+        if n < page_size:
+            break
+
+    return current_keys, current_ids
+
+def gc_quality_db_once():
+    """
+    Удаляет устаревшие записи:
+      - content_quality: логические ключи, которых нет в библиотеке и last seen старше GRACE
+      - media_quality: item_id, которых нет в библиотеке и last seen старше GRACE
+      - recent_quality_updates: маркеры по отсутствующим ключам
+    """
+    try:
+        current_keys, current_ids = _collect_current_movie_keys_and_ids()
+        cutoff = datetime.now(timezone.utc) - timedelta(days=QUALITY_GC_GRACE_DAYS)
+
+        conn = sqlite3.connect(QUALITY_DB_FILE)
+        cur = conn.cursor()
+
+        # --- content_quality
+        cur.execute("SELECT logical_key, date_seen FROM content_quality")
+        rows = cur.fetchall()
+        to_del_keys = []
+        for logical_key, date_seen in rows:
+            if logical_key in current_keys:
+                continue
+            dt = _iso_to_dt(date_seen)
+            if (dt is None) or (dt < cutoff):
+                to_del_keys.append(logical_key)
+
+        if to_del_keys:
+            for key in to_del_keys:
+                cur.execute("DELETE FROM content_quality WHERE logical_key=?", (key,))
+            logging.info(f"Quality GC: removed {len(to_del_keys)} content_quality rows")
+
+        # --- media_quality
+        cur.execute("SELECT item_id, date_seen FROM media_quality")
+        rows = cur.fetchall()
+        to_del_ids = []
+        for item_id, date_seen in rows:
+            if item_id in current_ids:
+                continue
+            dt = _iso_to_dt(date_seen)
+            if (dt is None) or (dt < cutoff):
+                to_del_ids.append(item_id)
+
+        if to_del_ids:
+            for iid in to_del_ids:
+                cur.execute("DELETE FROM media_quality WHERE item_id=?", (iid,))
+            logging.info(f"Quality GC: removed {len(to_del_ids)} media_quality rows")
+
+        # --- recent_quality_updates (маркеры подавления вебхука)
+        if to_del_keys:
+            for key in to_del_keys:
+                cur.execute("DELETE FROM recent_quality_updates WHERE logical_key=?", (key,))
+
+        conn.commit()
+
+        # по желанию можно иногда делать VACUUM (редко)
+        # cur.execute("VACUUM")  # если база компактность важна
+
+    except Exception as ex:
+        logging.warning(f"Quality GC error: {ex}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+_init_quality_db()
+
+# --- Форсированная очистка при старте (одноразово) ---
+if FORCE_QUALITY_GC_ON_START:
+    old_grace = QUALITY_GC_GRACE_DAYS
+    try:
+        # Если не задано явно — чистим без «грейса» (сразу)
+        QUALITY_GC_GRACE_DAYS = int(FORCE_QUALITY_GC_GRACE_DAYS) if FORCE_QUALITY_GC_GRACE_DAYS is not None else 0
+    except Exception:
+        logging.warning(f"FORCE_QUALITY_GC_GRACE_DAYS is not an int: {FORCE_QUALITY_GC_GRACE_DAYS}")
+        QUALITY_GC_GRACE_DAYS = 0
+
+    logging.info(f"Quality DB GC (startup forced): grace={QUALITY_GC_GRACE_DAYS}d, vacuum={FORCE_QUALITY_GC_VACUUM}")
+    try:
+        gc_quality_db_once()  # удалит записи по фильмам, которых уже нет в Jellyfin
+        if FORCE_QUALITY_GC_VACUUM:
+            try:
+                conn = sqlite3.connect(QUALITY_DB_FILE)
+                conn.execute("VACUUM")
+                conn.close()
+                logging.info("Quality DB GC (startup) VACUUM done.")
+            except Exception as ex:
+                logging.warning(f"Quality DB GC (startup) VACUUM failed: {ex}")
+    finally:
+        # вернём обычный grace для фоновой очистки
+        QUALITY_GC_GRACE_DAYS = old_grace
+
 
 
 
