@@ -1972,12 +1972,12 @@ def maybe_notify_movie_quality_change(*, item_id: str, movie_name_cleaned: str, 
 
     # рейтинги (если есть tmdb_id)
     if tmdb_id:
-        ratings_text = fetch_mdblist_ratings("movie", tmdb_id)
+        ratings_text = safe_fetch_mdblist_ratings("movie", tmdb_id)
         if ratings_text:
             notification_message += f"\n\n*{t('new_ratings_movie')}*\n{ratings_text}"
 
     # трейлер
-    trailer_url = get_youtube_trailer_url(f"{movie_name_cleaned} Trailer {release_year}")
+    trailer_url = safe_get_trailer(f"{movie_name_cleaned} Trailer {release_year}")
     if trailer_url:
         notification_message += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
 
@@ -2509,6 +2509,68 @@ if FORCE_QUALITY_GC_ON_START:
         # вернём обычный grace для фоновой очистки
         QUALITY_GC_GRACE_DAYS = old_grace
 
+#Работа я youtube и рейтингом
+
+# --- SAFE trailer & ratings helpers ---
+_youtube_forbid_until = 0.0
+_trailer_cache = {}   # на процесс
+_ratings_cache = {}   # на процесс
+
+def safe_get_trailer(query: str, *, context: str = "") -> str | None:
+    """
+    Ищем трейлер так, чтобы НИКОГДА не кидать исключений.
+    На 403 — ставим «предохранитель» и молчим заданное время.
+    """
+    try:
+        # (если у тебя уже есть эти ENV — используем, иначе можно убрать блок)
+        if os.getenv("TRAILER_FETCH_ENABLED", "1").lower() not in ("1","true","yes","on"):
+            return None
+        if os.getenv("DISABLE_TRAILER_IN_POLLS", "1").lower() in ("1","true","yes","on") and context == "series_poll":
+            return None
+
+        import time as _t
+        suspend_forbid_min = int(os.getenv("TRAILER_FORBID_SUSPEND_MIN", "60"))
+        if _t.time() < _youtube_forbid_until:
+            return None
+
+        if query in _trailer_cache:
+            return _trailer_cache[query]
+
+        url = safe_get_trailer(query)   # твоя исходная функция
+        if url:
+            _trailer_cache[query] = url
+        return url
+
+    except requests.HTTPError as ex:
+        resp = getattr(ex, "response", None)
+        if getattr(resp, "status_code", None) == 403:
+            import time as _t
+            globals()["_youtube_forbid_until"] = _t.time() + int(os.getenv("TRAILER_FORBID_SUSPEND_MIN", "60")) * 60
+            logging.warning("YouTube 403: трейлеры временно отключены, продолжаю без трейлера")
+            return None
+        logging.warning(f"YouTube HTTP error: {ex}")
+        return None
+    except Exception as ex:
+        logging.warning(f"YouTube trailer fetch failed: {ex}")
+        return None
+
+def safe_fetch_mdblist_ratings(kind: str, tmdb_id: str | None) -> str:
+    """
+    Безопасный вызов рейтингов — на любую ошибку просто вернёт пустую строку.
+    """
+    if not tmdb_id:
+        return ""
+    try:
+        cache_key = (kind, tmdb_id)
+        if cache_key in _ratings_cache:
+            return _ratings_cache[cache_key]
+        txt = fetch_mdblist_ratings(kind, tmdb_id) or ""
+        _ratings_cache[cache_key] = txt
+        return txt
+    except Exception as ex:
+        logging.warning(f"MDblist ratings failed: {ex}")
+        return ""
+
 #Работа с сезонными уведомлениями
 def jellyfin_count_present_episodes_in_season(season_id: str) -> int | None:
     """Только реально присутствующие эпизоды (есть физический файл)."""
@@ -2658,10 +2720,6 @@ def poll_recent_episodes_once():
                     processed_seasons.add(season_id)
                     continue
 
-                # рейтинги/трейлер (опционально)
-                tmdb_id = jellyfin_get_tmdb_id(series_id) if 'jellyfin_get_tmdb_id' in globals() else None
-                trailer_url = get_youtube_trailer_url(f"{series_name_cleaned} Trailer {release_year}")
-
                 # считаем «сколько есть / сколько всего» по сезону (используй твой resilient-хелпер)
                 # в poll_recent_episodes_once(), прямо перед подсчётом present/total:
                 wait_until_scan_idle("season counts build")
@@ -2682,6 +2740,13 @@ def poll_recent_episodes_once():
                 if not _sp_should_notify(season_id, present):
                     processed_seasons.add(season_id)
                     continue
+                # мы решили отправлять: сразу «закрываем» сезон на этот прогон,
+                # чтобы следующие эпизоды не повторяли внешние вызовы
+                processed_seasons.add(season_id)
+
+                # рейтинги/трейлер (опционально)
+                tmdb_id = jellyfin_get_tmdb_id(series_id) if 'jellyfin_get_tmdb_id' in globals() else None
+                trailer_url = safe_get_trailer(f"{series_name_cleaned} Trailer {release_year}")
 
                 # 3) формируем сообщение
                 notification_message = (
@@ -2695,7 +2760,7 @@ def poll_recent_episodes_once():
                 if overview_to_use:
                     notification_message += f"\n\n{overview_to_use}"
                 if tmdb_id:
-                    ratings_text = fetch_mdblist_ratings("show", tmdb_id)
+                    ratings_text = safe_fetch_mdblist_ratings("show", tmdb_id)
                     if ratings_text:
                         notification_message += f"\n\n*{t('new_ratings_show')}*\n{ratings_text}"
                 if trailer_url:
@@ -2873,7 +2938,7 @@ def announce_new_releases_from_jellyfin():
 
             # 2) Иначе — стандартное уведомление о новом фильме (как было)
             if not item_already_notified(item_type, item_name, release_year):
-                trailer_url = get_youtube_trailer_url(f"{movie_name_cleaned} Trailer {release_year}")
+                trailer_url = safe_get_trailer(f"{movie_name_cleaned} Trailer {release_year}")
 
                 notification_message = (
                     f"*{t('new_movie_title')}*\n\n*{movie_name_cleaned}* *({release_year})*\n\n{overview}\n\n"
@@ -2882,7 +2947,7 @@ def announce_new_releases_from_jellyfin():
 
                 if tmdb_id:
                     mdblist_type = item_type.lower()
-                    ratings_text = fetch_mdblist_ratings(mdblist_type, tmdb_id)
+                    ratings_text = safe_fetch_mdblist_ratings(mdblist_type, tmdb_id)
                     if ratings_text:
                         notification_message += f"\n\n*{t('new_ratings_movie')}*\n{ratings_text}"
 
@@ -2977,13 +3042,13 @@ def announce_new_releases_from_jellyfin():
                 # Remove release_year from series_name if present
                 series_name_cleaned = series_name.replace(f" ({release_year})", "").strip()
 
-                trailer_url = get_youtube_trailer_url(f"{series_name_cleaned} Trailer {release_year}")
+                trailer_url = safe_get_trailer(f"{series_name_cleaned} Trailer {release_year}")
 
                 # Get TMDb ID via external API
                 tmdb_id = jellyfin_get_tmdb_id(series_id)
 
                 # **Новые строки**: получаем рейтинги для сериала
-                ratings_text = fetch_mdblist_ratings("show", tmdb_id)
+                ratings_text = safe_fetch_mdblist_ratings("show", tmdb_id)
                 # Если есть рейтинги — добавляем пустую строку после них
                 ratings_section = f"{ratings_text}\n\n" if ratings_text else ""
 
