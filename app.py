@@ -18,6 +18,7 @@ from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, timedelta, timezone
+from collections import Counter, OrderedDict
 import sqlite3
 
 load_dotenv()
@@ -124,6 +125,9 @@ SCAN_TASK_NAME_MATCH = [s.strip() for s in os.getenv(
 EXTERNAL_CACHE_ENABLED = os.getenv("EXTERNAL_CACHE_ENABLED", "1").lower() in ("1","true","yes","on")
 TRAILER_CACHE_TTL_DAYS = int(os.getenv("TRAILER_CACHE_TTL_DAYS", "30"))
 RATINGS_CACHE_TTL_DAYS = int(os.getenv("RATINGS_CACHE_TTL_DAYS", "14"))
+# Пределы для блока аудио-дорожек у сезонов
+SEASON_AUDIO_TRACKS_MAX = int(os.getenv("SEASON_AUDIO_TRACKS_MAX", "12"))   # максимум уникальных дорожек
+SEASON_AUDIO_SCAN_LIMIT = int(os.getenv("SEASON_AUDIO_SCAN_LIMIT", "50"))   # максимум серий для сканирования (present)
 
 # Глобальные переменные
 imgbb_upload_done = threading.Event()   # Сигнал о завершении загрузки
@@ -2816,6 +2820,11 @@ def poll_recent_episodes_once():
                 if trailer_url:
                     notification_message += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
 
+                if INCLUDE_AUDIO_TRACKS:
+                    tracks_block = build_audio_tracks_block_for_season(season_id)
+                    if tracks_block:
+                        notification_message += tracks_block
+
                 # 4) отправляем и фиксируем «до куда сообщили»
                 if _fetch_jellyfin_image_with_retries(season_id, attempts=1, timeout=3):
                     send_notification(season_id, notification_message)
@@ -3135,6 +3144,223 @@ def safe_get_trailer_prefer_tmdb(
 
     # 3) Ничего не нашли: вернём устаревшее, если было
     return cached_val or None
+
+#Получение звуковых дорожек для сериалов
+def _label_audio_stream(stream: dict) -> str:
+    """
+    Формирует «человеческую» подпись дорожки как в фильмах:
+    DisplayTitle/Title -> иначе LANG CODEC Ch Layout (например: ENG AC3 6ch 5.1)
+    """
+    label = stream.get("DisplayTitle") or stream.get("Title")
+    if label:
+        return str(label)
+    lang = stream.get("Language")
+    codec = stream.get("Codec")
+    ch = stream.get("Channels")
+    layout = stream.get("ChannelLayout")
+    parts = []
+    if lang:   parts.append(str(lang).upper())
+    if codec:  parts.append(str(codec).upper())
+    if ch:     parts.append(f"{ch}ch")
+    if layout: parts.append(str(layout))
+    return " ".join(parts) or "Audio"
+
+def _collect_season_audio_labels(season_id: str) -> list[str]:
+    """
+    Собирает уникальные названия аудио-дорожек из фактически присутствующих эпизодов сезона.
+    Берём не более SEASON_AUDIO_SCAN_LIMIT эпизодов и не более SEASON_AUDIO_TRACKS_MAX уникальных дорожек.
+    """
+    labels_seen = []
+    label_set = set()
+
+    # запросим эпизоды сезона с MediaSources (как у тебя уже делается)
+    eps = _season_fetch_episodes(season_id)  # должен возвращать Items с MediaSources/LocationType/Path
+    # фильтруем только присутствующие (есть файл)
+    present_eps = [ep for ep in eps if _episode_has_file(ep)]
+
+    # ограничим количество эпизодов для разбора, чтобы не грузить лишнее
+    for ep in present_eps[:max(SEASON_AUDIO_SCAN_LIMIT, 1)]:
+        sources = ep.get("MediaSources") or []
+        if not sources:
+            continue
+        # возьмём первую «основную» дорожку источника
+        src = sources[0]
+        for s in (src.get("MediaStreams") or []):
+            if s.get("Type") != "Audio":
+                continue
+            lbl = _label_audio_stream(s)
+            if lbl not in label_set:
+                label_set.add(lbl)
+                labels_seen.append(lbl)
+                if len(labels_seen) >= SEASON_AUDIO_TRACKS_MAX:
+                    return labels_seen
+    return labels_seen
+
+def _season_fetch_episodes(season_id: str, *, max_items: int | None = None) -> list[dict]:
+    """
+    Возвращает список эпизодов сезона с нужными полями для анализа аудио:
+    - Берём ТОЛЬКО фактически присутствующие эпизоды (IsMissing=false, LocationTypes=FileSystem)
+    - Тянем поля MediaSources/LocationType/Path/IndexNumber/Name
+    - Пагинация до max_items (по умолчанию SEASON_AUDIO_SCAN_LIMIT или 50)
+    """
+    try:
+        per_page = 200
+        # ограничим объём: нам для списка дорожек достаточно просканировать часть сезона
+        default_scan_limit = 50
+        try:
+            default_scan_limit = max(int(globals().get("SEASON_AUDIO_SCAN_LIMIT", 50)), 1)
+        except Exception:
+            pass
+        cap = int(max_items) if isinstance(max_items, int) and max_items > 0 else default_scan_limit
+
+        all_eps: list[dict] = []
+        start = 0
+        while True:
+            # не запрашиваем больше, чем осталось до cap
+            limit = per_page if (len(all_eps) + per_page) <= cap else (cap - len(all_eps))
+            if limit <= 0:
+                break
+
+            params = {
+                "api_key": JELLYFIN_API_KEY,
+                "ParentId": season_id,
+                "IncludeItemTypes": "Episode",
+                "Recursive": "false",
+                # ключевые фильтры: только реальные файлы
+                "IsMissing": "false",
+                "LocationTypes": "FileSystem",
+                # сортируем по номеру эпизода
+                "SortBy": "IndexNumber,DateCreated",
+                "SortOrder": "Ascending",
+                "StartIndex": str(start),
+                "Limit": str(limit),
+                # поля, нужные для аудио-аналитики
+                "Fields": "MediaSources,LocationType,Path,IndexNumber,Name"
+            }
+            url = f"{JELLYFIN_BASE_URL}/emby/Items"
+            r = requests.get(url, params=params, timeout=12)
+            r.raise_for_status()
+            data = r.json() or {}
+            items = data.get("Items") or []
+            if not items:
+                break
+
+            all_eps.extend(items)
+            start += len(items)
+            if len(items) < limit:
+                break  # последняя страница
+
+        return all_eps
+    except Exception as ex:
+        logging.warning(f"_season_fetch_episodes failed (season {season_id}): {ex}")
+        return []
+
+
+def _episode_has_file(ep: dict) -> bool:
+    """
+    Возвращает True, если у эпизода есть реальный файл.
+    Проверяем:
+      - LocationType == FileSystem/File (на всякий случай)
+      - или задан Path
+      - или есть MediaSources (не пусто) с признаками файла
+    """
+    try:
+        lt = (ep.get("LocationType") or "").strip().lower()
+        if lt in ("filesystem", "file"):
+            return True
+
+        if ep.get("Path"):
+            return True
+
+        ms = ep.get("MediaSources") or []
+        if ms:
+            for src in ms:
+                # Признаки реального файла в источнике
+                src_lt = (src.get("LocationType") or "").strip().lower()
+                if src_lt in ("filesystem", "file"):
+                    return True
+                if src.get("Path"):
+                    return True
+                # Наличие контейнера/размера часто говорит о локальном файле
+                if src.get("Container") or src.get("Size"):
+                    return True
+        return False
+    except Exception:
+        return False
+
+def _plural_episodes(n: int, lang: str) -> str:
+    lang = (lang or "").lower()
+    if lang.startswith("ru"):
+        n10, n100 = n % 10, n % 100
+        if n10 == 1 and n100 != 11:
+            return "эпизод"
+        if 2 <= n10 <= 4 and not (12 <= n100 <= 14):
+            return "эпизода"
+        return "эпизодов"
+    return "episode" if n == 1 else "episodes"
+
+def _collect_season_audio_label_counts(season_id: str) -> tuple[OrderedDict[str, int], int]:
+    """
+    Возвращает (упорядоченный словарь label -> count, present_episodes_count).
+    Берём только присутствующие эпизоды сезона, ограничиваемся SEASON_AUDIO_SCAN_LIMIT.
+    """
+    try:
+        # тянем эпизоды (функция уже фильтрует present: IsMissing=false, LocationTypes=FileSystem)
+        eps = _season_fetch_episodes(season_id)
+        present_eps = [ep for ep in eps if _episode_has_file(ep)]  # доп. страховка
+
+        scan_limit = max(int(globals().get("SEASON_AUDIO_SCAN_LIMIT", 50)), 1)
+        counter = Counter()
+
+        for ep in present_eps[:scan_limit]:
+            sources = ep.get("MediaSources") or []
+            if not sources:
+                continue
+            src = sources[0]
+            for s in (src.get("MediaStreams") or []):
+                if s.get("Type") != "Audio":
+                    continue
+                lbl = _label_audio_stream(s)
+                counter[lbl] += 1
+
+        ordered = OrderedDict(sorted(counter.items(), key=lambda kv: (-kv[1], kv[0])))
+        return ordered, len(present_eps)
+    except Exception as ex:
+        logging.warning(f"_collect_season_audio_label_counts failed for {season_id}: {ex}")
+        return OrderedDict(), 0
+
+def build_audio_tracks_block_for_season(season_id: str) -> str:
+    """
+    Формирует текстовый блок аудио-дорожек для сезона в виде:
+      *Audio tracks* (N)
+      - RUS AC3 5.1 × 5 эпизодов
+      - ENG EAC3 6ch × 3 эпизода
+      ...
+    """
+    try:
+        labels_counts, present_cnt = _collect_season_audio_label_counts(season_id)
+        if not labels_counts:
+            return ""
+
+        lang = os.environ.get("LANGUAGE", "en")
+        # заголовок (fallback, если нет ключа локализации)
+        header = (MESSAGES.get(LANG, {}) or {}).get("audio_tracks_header") or \
+                 ( "Аудио-дорожки" if lang.lower().startswith("ru") else "Audio tracks" )
+
+        max_labels = max(int(globals().get("SEASON_AUDIO_TRACKS_MAX", 12)), 1)
+        lines = [f"\n\n*{header}* ({min(len(labels_counts), max_labels)})"]
+
+        i = 0
+        for label, count in labels_counts.items():
+            if i >= max_labels:
+                break
+            lines.append(f"- {label} × {count} {_plural_episodes(count, lang)}")
+            i += 1
+
+        return "\n".join(lines)
+    except Exception as ex:
+        logging.warning(f"Season audio block build failed for {season_id}: {ex}")
+        return ""
 
 
 @app.route("/webhook", methods=["POST"])
