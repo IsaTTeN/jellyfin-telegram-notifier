@@ -110,6 +110,15 @@ SERIES_POLL_MAX_TOTAL = int(os.getenv("SERIES_POLL_MAX_TOTAL", "0"))  # 0 = бе
 SERIES_POLL_GRACE_MIN = int(os.getenv("SERIES_POLL_GRACE_MIN", "0"))  # свежие эпизоды отдаём на откуп вебхуку
 # Посылать ли уведомление при ПЕРВОМ обнаружении сезона (по умолчанию нет)
 SERIES_POLL_INITIAL_ANNOUNCE = os.getenv("SERIES_POLL_INITIAL_ANNOUNCE", "1").lower() in ("1","true","yes","on")
+# Блокировать таймеры отправки на время сканирования библиотеки Jellyfin
+NOTIFY_BLOCK_DURING_SCAN = os.getenv("NOTIFY_BLOCK_DURING_SCAN", "1").lower() in ("1","true","yes","on")
+SCAN_RECHECK_DELAY_SEC = int(os.getenv("SCAN_RECHECK_DELAY_SEC", "5"))   # пауза между проверками
+MAX_SCAN_WAIT_MIN = int(os.getenv("MAX_SCAN_WAIT_MIN", "0"))             # 0 = ждать бесконечно
+# Какие имена задач считать «сканом» (нижний регистр, через запятую)
+SCAN_TASK_NAME_MATCH = [s.strip() for s in os.getenv(
+    "SCAN_TASK_NAME_MATCH",
+    "scan,library,metadata,refresh"
+).lower().split(",") if s.strip()]
 
 # Глобальные переменные
 imgbb_upload_done = threading.Event()   # Сигнал о завершении загрузки
@@ -308,6 +317,100 @@ def t(key: str) -> str:
     Если ключ отсутствует — падает KeyError, чтобы вы не пропустили необходимость перевода.
     """
     return MESSAGES[LANG][key]
+
+#Обнаружение сканирования
+def _task_name_matches(name: str | None) -> bool:
+    if not name:
+        return False
+    n = name.lower()
+    return any(seg in n for seg in SCAN_TASK_NAME_MATCH)
+
+def is_jellyfin_scanning() -> tuple[bool, str | None]:
+    """
+    Пытаемся понять, выполняется ли сейчас скан/рефреш медиатеки/метаданных в Jellyfin.
+    1) /emby/ScheduledTasks/Running (если поддерживается)
+    2) /emby/ScheduledTasks (ищем состояния Running/Executing/IsRunning)
+    Возврат: (True/False, краткое описание)
+    """
+    headers = {'accept': 'application/json'}
+    params = {'api_key': JELLYFIN_API_KEY}
+
+    # 1) текущие выполняемые задачи
+    try:
+        url = f"{JELLYFIN_BASE_URL}/emby/ScheduledTasks/Running"
+        r = requests.get(url, headers=headers, params=params, timeout=6)
+        if r.status_code == 200:
+            data = r.json() or []
+            for t in data:
+                name = t.get("Name") or t.get("Key") or ""
+                state = t.get("State") or ""
+                prog = t.get("CurrentProgressPercentage") or t.get("Progress") or t.get("PercentComplete")
+                if _task_name_matches(name):
+                    desc = f"{name} {prog}%" if prog is not None else name
+                    return True, desc
+    except Exception:
+        pass
+
+    # 2) общий список задач
+    try:
+        url = f"{JELLYFIN_BASE_URL}/emby/ScheduledTasks"
+        r = requests.get(url, headers=headers, params=params, timeout=8)
+        if r.status_code == 200:
+            data = r.json() or []
+            for t in data:
+                name = t.get("Name") or t.get("Key") or ""
+                state = (t.get("State") or "").lower()
+                is_running = bool(t.get("IsRunning")) or state in ("running", "executing", "inprogress")
+                if is_running and _task_name_matches(name):
+                    prog = t.get("CurrentProgressPercentage") or t.get("Progress") or t.get("PercentComplete")
+                    desc = f"{name} {prog}%" if prog is not None else name
+                    return True, desc
+    except Exception:
+        pass
+
+    return False, None
+
+def wait_until_scan_idle(reason: str = ""):
+    """
+    Если включён NOTIFY_BLOCK_DURING_SCAN — ждём завершения скана Jellyfin.
+    MAX_SCAN_WAIT_MIN=0 => ждём бесконечно.
+    """
+    if not NOTIFY_BLOCK_DURING_SCAN:
+        return
+    start = time.time()
+    first_log = True
+    while True:
+        running, detail = is_jellyfin_scanning()
+        if not running:
+            if not first_log:
+                logging.info("Jellyfin scan finished, resume timers.")
+            return
+        if first_log:
+            logging.info(f"Timers paused: Jellyfin is scanning ({detail or 'library task running'})"
+                         + (f" [reason: {reason}]" if reason else ""))
+            first_log = False
+        if MAX_SCAN_WAIT_MIN and (time.time() - start) > MAX_SCAN_WAIT_MIN * 60:
+            logging.warning("Max wait for scan reached; resuming timers anyway.")
+            return
+        time.sleep(max(SCAN_RECHECK_DELAY_SEC, 1))
+
+def _movie_poll_loop():
+    while True:
+        try:
+            wait_until_scan_idle("movie poll")
+            poll_recent_movies_once()
+        except Exception as ex:
+            logging.warning(f"Movie poll loop error: {ex}")
+        time.sleep(MOVIE_POLL_INTERVAL_SEC)
+
+def _series_poll_loop():
+    while True:
+        try:
+            wait_until_scan_idle("series poll")
+            poll_recent_episodes_once()
+        except Exception as ex:
+            logging.warning(f"Series poll loop error: {ex}")
+        time.sleep(SERIES_POLL_INTERVAL_SEC)
 
 def _wa_get_jid_from_env():
     """
@@ -2560,6 +2663,8 @@ def poll_recent_episodes_once():
                 trailer_url = get_youtube_trailer_url(f"{series_name_cleaned} Trailer {release_year}")
 
                 # считаем «сколько есть / сколько всего» по сезону (используй твой resilient-хелпер)
+                # в poll_recent_episodes_once(), прямо перед подсчётом present/total:
+                wait_until_scan_idle("season counts build")
                 present, total = jellyfin_get_season_counts_resilient(season_id)
 
                 # 1) сохраняем «наблюдение» (без mark_notified) — чтобы иметь базу для следующего раза
