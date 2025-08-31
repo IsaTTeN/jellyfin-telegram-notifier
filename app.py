@@ -3301,16 +3301,17 @@ def _plural_episodes(n: int, lang: str) -> str:
 
 def _collect_season_audio_label_counts(season_id: str) -> tuple[OrderedDict[str, int], int]:
     """
-    Возвращает (упорядоченный словарь label -> count, present_episodes_count).
-    Берём только присутствующие эпизоды сезона, ограничиваемся SEASON_AUDIO_SCAN_LIMIT.
+    Возвращает (OrderedDict[display_label -> count], present_episodes_count).
+    Группирует метки дорожек с учётом нормализации (_normalize_audio_label),
+    чтобы 'HDRezka' и 'HDrezka' считались одной дорожкой.
     """
     try:
-        # тянем эпизоды (функция уже фильтрует present: IsMissing=false, LocationTypes=FileSystem)
         eps = _season_fetch_episodes(season_id)
-        present_eps = [ep for ep in eps if _episode_has_file(ep)]  # доп. страховка
-
+        present_eps = [ep for ep in eps if _episode_has_file(ep)]
         scan_limit = max(int(globals().get("SEASON_AUDIO_SCAN_LIMIT", 50)), 1)
-        counter = Counter()
+
+        # norm_label -> [display_label (первая встреченная), count]
+        groups: dict[str, list] = {}
 
         for ep in present_eps[:scan_limit]:
             sources = ep.get("MediaSources") or []
@@ -3320,10 +3321,17 @@ def _collect_season_audio_label_counts(season_id: str) -> tuple[OrderedDict[str,
             for s in (src.get("MediaStreams") or []):
                 if s.get("Type") != "Audio":
                     continue
-                lbl = _label_audio_stream(s)
-                counter[lbl] += 1
+                raw_label = _label_audio_stream(s)
+                norm = _normalize_audio_label(raw_label)
+                if norm not in groups:
+                    # сохраним человекочитаемую метку «как встретилась впервые»
+                    groups[norm] = [raw_label.strip(), 1]
+                else:
+                    groups[norm][1] += 1
 
-        ordered = OrderedDict(sorted(counter.items(), key=lambda kv: (-kv[1], kv[0])))
+        # Сортировка: по убыванию счётчика, затем по метке (нормализованной)
+        sorted_items = sorted(groups.items(), key=lambda kv: (-kv[1][1], kv[0]))
+        ordered = OrderedDict((disp, cnt) for (_norm, (disp, cnt)) in sorted_items)
         return ordered, len(present_eps)
     except Exception as ex:
         logging.warning(f"_collect_season_audio_label_counts failed for {season_id}: {ex}")
@@ -3361,6 +3369,20 @@ def build_audio_tracks_block_for_season(season_id: str) -> str:
     except Exception as ex:
         logging.warning(f"Season audio block build failed for {season_id}: {ex}")
         return ""
+
+def _normalize_audio_label(label: str) -> str:
+    """
+    Приводит метку к каноническому виду для сравнения:
+    - casefold (регистронезависимо)
+    - нормализация длинных тире к '-'
+    - единые пробелы вокруг дефиса и внутри строки
+    """
+    s = (label or "").strip()
+    s = re.sub(r"[–—−]", "-", s)              # все тире -> '-'
+    s = re.sub(r"\s*-\s*", " - ", s)          # пробелы вокруг дефиса
+    s = re.sub(r"\s+", " ", s)                # схлопнуть пробелы
+    return s.casefold()                        # регистронезависимо
+
 
 
 @app.route("/webhook", methods=["POST"])
