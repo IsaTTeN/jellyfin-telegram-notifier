@@ -52,7 +52,9 @@ MDBLIST_API_KEY = os.environ.get("MDBLIST_API_KEY", "")
 IMGBB_API_KEY = os.environ.get("IMGBB_API_KEY", "")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY")
+TMDB_LANGUAGE = os.getenv("TMDB_LANGUAGE", "en-US")  # напр. "ru-RU"
 TMDB_SEARCH_URL = "https://api.themoviedb.org/3/search/tv"
+TMDB_BASE = "https://api.themoviedb.org/3"
 LANGUAGE = os.environ["LANGUAGE"]
 EPISODE_PREMIERED_WITHIN_X_DAYS = int(os.environ["EPISODE_PREMIERED_WITHIN_X_DAYS"])
 SEASON_ADDED_WITHIN_X_DAYS = int(os.environ["SEASON_ADDED_WITHIN_X_DAYS"])
@@ -1999,7 +2001,8 @@ def maybe_notify_movie_quality_change(*, item_id: str, movie_name_cleaned: str, 
             notification_message += f"\n\n*{t('new_ratings_movie')}*\n{ratings_text}"
 
     # трейлер
-    trailer_url = safe_get_trailer(f"{movie_name_cleaned} Trailer {release_year}")
+    trailer_url = safe_get_trailer_prefer_tmdb(f"{movie_name_cleaned} Trailer {release_year}",
+                                context="webhook", subkind="movie", tmdb_id=tmdb_id)
     if trailer_url:
         notification_message += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
 
@@ -2792,7 +2795,8 @@ def poll_recent_episodes_once():
 
                 # рейтинги/трейлер (опционально)
                 tmdb_id = jellyfin_get_tmdb_id(series_id) if 'jellyfin_get_tmdb_id' in globals() else None
-                trailer_url = safe_get_trailer(f"{series_name_cleaned} Trailer {release_year}")
+                trailer_url = safe_get_trailer_prefer_tmdb(f"{series_name_cleaned} Trailer {release_year}",
+                                context="series_poll", subkind="show", tmdb_id=tmdb_id)
 
                 # 3) формируем сообщение
                 notification_message = (
@@ -2993,6 +2997,145 @@ def _is_fresh(updated_iso: str | None, ttl_days: int) -> bool:
     except Exception:
         return False
 
+#Поиск трейлеров на tmdb
+def _tmdb_pick_best_video(results: list[dict]) -> str | None:
+    """
+    Выбираем лучшую ссылку на трейлер из TMDB /videos.
+    Приоритет: YouTube + type=Trailer + official=true → YouTube + Trailer → YouTube → Vimeo.
+    """
+    if not results:
+        return None
+
+    def to_url(site: str | None, key: str | None) -> str | None:
+        if not site or not key:
+            return None
+        s = site.lower()
+        if s == "youtube":
+            return f"https://www.youtube.com/watch?v={key}"
+        if s == "vimeo":
+            return f"https://vimeo.com/{key}"
+        return None
+
+    # нормализуем
+    vids = []
+    for v in results:
+        vids.append({
+            "site": (v.get("site") or v.get("Site") or "").strip(),
+            "type": (v.get("type") or v.get("Type") or "").strip(),
+            "official": bool(v.get("official") if v.get("official") is not None else v.get("Official")),
+            "key": v.get("key") or v.get("Key"),
+            "size": v.get("size") or v.get("Size") or 0,
+            "published_at": v.get("published_at") or v.get("PublishedAt") or "",
+        })
+
+    # 1) YouTube + Trailer + official
+    for v in vids:
+        if v["site"].lower() == "youtube" and v["type"].lower() == "trailer" and v["official"]:
+            u = to_url(v["site"], v["key"])
+            if u: return u
+    # 2) YouTube + Trailer
+    for v in vids:
+        if v["site"].lower() == "youtube" and v["type"].lower() == "trailer":
+            u = to_url(v["site"], v["key"])
+            if u: return u
+    # 3) любой YouTube
+    for v in vids:
+        if v["site"].lower() == "youtube":
+            u = to_url(v["site"], v["key"])
+            if u: return u
+    # 4) Vimeo (на всякий случай)
+    for v in vids:
+        if v["site"].lower() == "vimeo":
+            u = to_url(v["site"], v["key"])
+            if u: return u
+    return None
+
+
+def _tmdb_fetch_trailer_url(subkind: str, tmdb_id: str, season_number: int | None = None) -> str | None:
+    """
+    subkind: 'movie' | 'show'
+    Для фильмов: /movie/{id}/videos
+    Для сериалов: /tv/{id}/videos, при необходимости пробуем /tv/{id}/season/{n}/videos
+    """
+    if not TMDB_API_KEY or not tmdb_id:
+        return None
+    try:
+        params = {
+            "api_key": TMDB_API_KEY,
+            "language": TMDB_LANGUAGE,
+            # включить ролики без языковой метки
+            "include_video_language": f"{TMDB_LANGUAGE},null"
+        }
+        if subkind == "movie":
+            url = f"{TMDB_BASE}/movie/{tmdb_id}/videos"
+            r = requests.get(url, params=params, timeout=10)
+            r.raise_for_status()
+            data = r.json() or {}
+            return _tmdb_pick_best_video(data.get("results") or [])
+        else:
+            # пробуем уровень сериала
+            url = f"{TMDB_BASE}/tv/{tmdb_id}/videos"
+            r = requests.get(url, params=params, timeout=10)
+            r.raise_for_status()
+            data = r.json() or {}
+            url_pick = _tmdb_pick_best_video(data.get("results") or [])
+            if url_pick:
+                return url_pick
+            # при необходимости — уровень сезона
+            if season_number is not None:
+                url = f"{TMDB_BASE}/tv/{tmdb_id}/season/{int(season_number)}/videos"
+                r = requests.get(url, params=params, timeout=10)
+                r.raise_for_status()
+                data = r.json() or {}
+                return _tmdb_pick_best_video(data.get("results") or [])
+            return None
+    except Exception as ex:
+        logging.warning(f"TMDB trailer fetch failed ({subkind}:{tmdb_id} s{season_number}): {ex}")
+        return None
+
+def safe_get_trailer_prefer_tmdb(
+    title: str,
+    *,
+    year: int | None = None,
+    subkind: str,                 # 'movie' | 'show'
+    tmdb_id: str | None = None,
+    season_number: int | None = None,
+    context: str = ""
+) -> str | None:
+    """
+    1) Читаем кэш external_cache('trailer', subkind, identity) — identity=tmdb_id или title+year.
+    2) Если кэш свежий — отдаём.
+    3) Иначе пробуем TMDB → если нашли — пишем в кэш и отдаём.
+    4) Иначе fallback: YouTube-поиск через safe_get_trailer(query, ...), тоже кладём в кэш.
+    """
+    # формируем identity и query для кэша/фоллбэка
+    identity = (tmdb_id or "").strip() or f"{title.strip()} ({year})".strip()
+    cached_val, cached_at = _extcache_read("trailer", subkind, identity)
+    if _is_fresh(cached_at, TRAILER_CACHE_TTL_DAYS) and cached_val:
+        return cached_val
+
+    # 1) TMDB
+    url_tmdb = None
+    try:
+        url_tmdb = _tmdb_fetch_trailer_url(subkind, tmdb_id, season_number) if tmdb_id else None
+    except Exception as ex:
+        logging.warning(f"safe_get_trailer_prefer_tmdb: TMDB branch failed: {ex}")
+
+    if url_tmdb:
+        _extcache_write("trailer", subkind, identity, url_tmdb)
+        return url_tmdb
+
+    # 2) Fallback: YouTube по названию + году
+    q_year = f" {year}" if year else ""
+    query = f"{title} Trailer{q_year}".strip()
+    url_yt = safe_get_trailer(query, context=context, subkind=subkind, tmdb_id=tmdb_id)
+    if url_yt:
+        _extcache_write("trailer", subkind, identity, url_yt)
+        return url_yt
+
+    # 3) Ничего не нашли: вернём устаревшее, если было
+    return cached_val or None
+
 
 @app.route("/webhook", methods=["POST"])
 def announce_new_releases_from_jellyfin():
@@ -3039,7 +3182,8 @@ def announce_new_releases_from_jellyfin():
 
             # 2) Иначе — стандартное уведомление о новом фильме (как было)
             if not item_already_notified(item_type, item_name, release_year):
-                trailer_url = safe_get_trailer(f"{movie_name_cleaned} Trailer {release_year}")
+                trailer_url = safe_get_trailer_prefer_tmdb(f"{movie_name_cleaned} Trailer {release_year}",
+                                context="webhook", subkind="movie", tmdb_id=tmdb_id)
 
                 notification_message = (
                     f"*{t('new_movie_title')}*\n\n*{movie_name_cleaned}* *({release_year})*\n\n{overview}\n\n"
@@ -3143,7 +3287,8 @@ def announce_new_releases_from_jellyfin():
                 # Remove release_year from series_name if present
                 series_name_cleaned = series_name.replace(f" ({release_year})", "").strip()
 
-                trailer_url = safe_get_trailer(f"{series_name_cleaned} Trailer {release_year}")
+                trailer_url = safe_get_trailer_prefer_tmdb(f"{series_name_cleaned} Trailer {release_year}",
+                                context="series_poll", subkind="show", tmdb_id=tmdb_id)
 
                 # Get TMDb ID via external API
                 tmdb_id = jellyfin_get_tmdb_id(series_id)
