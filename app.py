@@ -119,6 +119,9 @@ SCAN_TASK_NAME_MATCH = [s.strip() for s in os.getenv(
     "SCAN_TASK_NAME_MATCH",
     "scan,library,metadata,refresh"
 ).lower().split(",") if s.strip()]
+EXTERNAL_CACHE_ENABLED = os.getenv("EXTERNAL_CACHE_ENABLED", "1").lower() in ("1","true","yes","on")
+TRAILER_CACHE_TTL_DAYS = int(os.getenv("TRAILER_CACHE_TTL_DAYS", "30"))
+RATINGS_CACHE_TTL_DAYS = int(os.getenv("RATINGS_CACHE_TTL_DAYS", "14"))
 
 # Глобальные переменные
 imgbb_upload_done = threading.Event()   # Сигнал о завершении загрузки
@@ -230,6 +233,25 @@ def _init_quality_db():
                         0, -- до какого значения уже сообщали
                         updated_at
                         TEXT
+                    )
+                    """)
+        cur.execute("""
+                    CREATE TABLE IF NOT EXISTS external_cache
+                    (
+                        cache_key
+                        TEXT
+                        PRIMARY
+                        KEY,  -- уникальный ключ (см. ниже)
+                        kind
+                        TEXT
+                        NOT
+                        NULL, -- 'trailer' | 'ratings'
+                        subkind
+                        TEXT, -- 'movie' | 'show' (для рейтингов/трейлеров)
+                        value
+                        TEXT, -- для трейлера: URL; для рейтингов: готовый текст
+                        updated_at
+                        TEXT  -- ISO8601 UTC, когда обновляли
                     )
                     """)
         # --- Мягкая миграция: добавляем колонку image_profiles, если её ещё нет
@@ -2516,60 +2538,84 @@ _youtube_forbid_until = 0.0
 _trailer_cache = {}   # на процесс
 _ratings_cache = {}   # на процесс
 
-def safe_get_trailer(query: str, *, context: str = "") -> str | None:
+def safe_get_trailer(query: str, *, context: str = "", subkind: str | None = None, tmdb_id: str | None = None) -> str | None:
     """
-    Ищем трейлер так, чтобы НИКОГДА не кидать исключений.
-    На 403 — ставим «предохранитель» и молчим заданное время.
+    Ищем трейлер безопасно + кэшируем в БД.
+    Идентификатор кэша берём по приоритету: tmdb_id → нормализованный query.
+    subkind: 'movie' | 'show' (для удобства TTL/аналитики; к ключу не обязательно)
     """
+    # правила отключения
     try:
-        # (если у тебя уже есть эти ENV — используем, иначе можно убрать блок)
         if os.getenv("TRAILER_FETCH_ENABLED", "1").lower() not in ("1","true","yes","on"):
             return None
         if os.getenv("DISABLE_TRAILER_IN_POLLS", "1").lower() in ("1","true","yes","on") and context == "series_poll":
             return None
+    except Exception:
+        pass
 
+    # ключ кэша
+    identity = tmdb_id or query.strip()
+    # 1) читаем кэш
+    cached_val, cached_at = _extcache_read("trailer", subkind, identity)
+    if _is_fresh(cached_at, TRAILER_CACHE_TTL_DAYS) and cached_val:
+        return cached_val
+
+    # 2) не свежий — пробуем обновить из сети (с 403-предохранителем)
+    try:
+        # локальный «стоп» по 403
         import time as _t
-        suspend_forbid_min = int(os.getenv("TRAILER_FORBID_SUSPEND_MIN", "60"))
-        if _t.time() < _youtube_forbid_until:
-            return None
+        forbid_until = globals().get("_youtube_forbid_until", 0.0)
+        if _t.time() < forbid_until:
+            return cached_val or None
 
-        if query in _trailer_cache:
-            return _trailer_cache[query]
-
-        url = safe_get_trailer(query)   # твоя исходная функция
+        url = get_youtube_trailer_url(query)  # твоя исходная функция
         if url:
-            _trailer_cache[query] = url
-        return url
+            _extcache_write("trailer", subkind, identity, url)
+            return url
+        # если не нашли — вернём устаревшее, чтобы не ломать текст
+        return cached_val or None
 
     except requests.HTTPError as ex:
         resp = getattr(ex, "response", None)
         if getattr(resp, "status_code", None) == 403:
+            # при 403 — ставим «форбид» и используем кэш
             import time as _t
-            globals()["_youtube_forbid_until"] = _t.time() + int(os.getenv("TRAILER_FORBID_SUSPEND_MIN", "60")) * 60
-            logging.warning("YouTube 403: трейлеры временно отключены, продолжаю без трейлера")
-            return None
+            suspend_min = int(os.getenv("TRAILER_FORBID_SUSPEND_MIN", "60"))
+            globals()["_youtube_forbid_until"] = _t.time() + suspend_min * 60
+            logging.warning(f"YouTube 403; suspend {suspend_min} min; use cache if any")
+            return cached_val or None
         logging.warning(f"YouTube HTTP error: {ex}")
-        return None
+        return cached_val or None
     except Exception as ex:
         logging.warning(f"YouTube trailer fetch failed: {ex}")
-        return None
+        return cached_val or None
 
 def safe_fetch_mdblist_ratings(kind: str, tmdb_id: str | None) -> str:
     """
-    Безопасный вызов рейтингов — на любую ошибку просто вернёт пустую строку.
+    Возвращает текст рейтингов. Сначала читаем кэш из БД, если он свежий.
+    Если кэш просрочен — пробуем обновить; при ошибке отдаём устаревшее.
+    kind: 'movie' | 'show'
     """
     if not tmdb_id:
         return ""
+    # 1) читаем кэш
+    cached_val, cached_at = _extcache_read("ratings", kind, tmdb_id)
+    if _is_fresh(cached_at, RATINGS_CACHE_TTL_DAYS) and cached_val:
+        return cached_val
+
+    # 2) пробуем обновить из сети
+    fresh = ""
     try:
-        cache_key = (kind, tmdb_id)
-        if cache_key in _ratings_cache:
-            return _ratings_cache[cache_key]
-        txt = fetch_mdblist_ratings(kind, tmdb_id) or ""
-        _ratings_cache[cache_key] = txt
-        return txt
+        fresh = fetch_mdblist_ratings(kind, tmdb_id) or ""
     except Exception as ex:
-        logging.warning(f"MDblist ratings failed: {ex}")
-        return ""
+        logging.warning(f"MDblist ratings fetch failed: {ex}")
+
+    if fresh:
+        _extcache_write("ratings", kind, tmdb_id, fresh)
+        return fresh
+
+    # 3) если не удалось обновить — вернём устаревшее (не ломаем уведомления)
+    return cached_val or ""
 
 #Работа с сезонными уведомлениями
 def jellyfin_count_present_episodes_in_season(season_id: str) -> int | None:
@@ -2890,7 +2936,62 @@ def _sp_should_notify(season_id: str, present_now: int) -> bool:
     last = int(row.get("last_notified_present") or 0)
     return present_now > last
 
+#Сохранение трейлеров и рейтингов в базу данных
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
 
+def _extcache_key(kind: str, subkind: str | None, identity: str) -> str:
+    # Единый формат ключа
+    s = subkind or "-"
+    return f"{kind}:{s}:{identity}".strip()
+
+def _extcache_read(kind: str, subkind: str | None, identity: str) -> tuple[str | None, str | None]:
+    """
+    Возвращает (value, updated_at_iso) из external_cache или (None, None).
+    """
+    if not EXTERNAL_CACHE_ENABLED:
+        return (None, None)
+    try:
+        conn = sqlite3.connect(QUALITY_DB_FILE)
+        cur = conn.cursor()
+        ck = _extcache_key(kind, subkind, identity)
+        cur.execute("SELECT value, updated_at FROM external_cache WHERE cache_key=?", (ck,))
+        row = cur.fetchone()
+        return (row[0], row[1]) if row else (None, None)
+    except Exception as ex:
+        logging.warning(f"_extcache_read fail: {ex}")
+        return (None, None)
+    finally:
+        try: conn.close()
+        except: pass
+
+def _extcache_write(kind: str, subkind: str | None, identity: str, value: str | None):
+    if not EXTERNAL_CACHE_ENABLED:
+        return
+    try:
+        conn = sqlite3.connect(QUALITY_DB_FILE)
+        cur = conn.cursor()
+        ck = _extcache_key(kind, subkind, identity)
+        cur.execute("""
+            INSERT INTO external_cache (cache_key, kind, subkind, value, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+        """, (ck, kind, subkind or "", value or "", _utcnow_iso()))
+        conn.commit()
+    except Exception as ex:
+        logging.warning(f"_extcache_write fail: {ex}")
+    finally:
+        try: conn.close()
+        except: pass
+
+def _is_fresh(updated_iso: str | None, ttl_days: int) -> bool:
+    if not updated_iso:
+        return False
+    try:
+        dt = datetime.fromisoformat(updated_iso.replace('Z', '+00:00'))
+        return datetime.now(timezone.utc) - dt <= timedelta(days=max(ttl_days, 0))
+    except Exception:
+        return False
 
 
 @app.route("/webhook", methods=["POST"])
