@@ -102,6 +102,15 @@ FORCE_QUALITY_GC_VACUUM = os.getenv("FORCE_QUALITY_GC_VACUUM", "0").lower() in (
 INCLUDE_AUDIO_TRACKS = os.getenv("INCLUDE_AUDIO_TRACKS", "1").lower() in ("1", "true", "yes", "on")
 #подавление дублирующих сообщение webhook если это былдо обновление контента
 SUPPRESS_WEBHOOK_AFTER_QUALITY_UPDATE_MIN = int(os.getenv("SUPPRESS_WEBHOOK_AFTER_QUALITY_UPDATE_MIN", "60"))  # по умолчанию 60 минут
+# Опрос сериалов (по новым/изменённым эпизодам)
+SERIES_POLL_ENABLED = os.getenv("SERIES_POLL_ENABLED", "1").lower() in ("1","true","yes","on")
+SERIES_POLL_INTERVAL_SEC = int(os.getenv("SERIES_POLL_INTERVAL_SEC", "80"))  # период, сек
+SERIES_POLL_PAGE_SIZE = int(os.getenv("SERIES_POLL_PAGE_SIZE", "500"))
+SERIES_POLL_MAX_TOTAL = int(os.getenv("SERIES_POLL_MAX_TOTAL", "0"))  # 0 = без ограничения
+SERIES_POLL_GRACE_MIN = int(os.getenv("SERIES_POLL_GRACE_MIN", "0"))  # свежие эпизоды отдаём на откуп вебхуку
+# Посылать ли уведомление при ПЕРВОМ обнаружении сезона (по умолчанию нет)
+SERIES_POLL_INITIAL_ANNOUNCE = os.getenv("SERIES_POLL_INITIAL_ANNOUNCE", "1").lower() in ("1","true","yes","on")
+
 # Глобальные переменные
 imgbb_upload_done = threading.Event()   # Сигнал о завершении загрузки
 uploaded_image_url = None               # Здесь хранится ссылка после удачной загрузки
@@ -183,6 +192,37 @@ def _init_quality_db():
                         TEXT
                     )
                     """)
+        cur.execute("""
+                    CREATE TABLE IF NOT EXISTS season_progress
+                    (
+                        season_id
+                        TEXT
+                        PRIMARY
+                        KEY,
+                        series_id
+                        TEXT,
+                        series_name
+                        TEXT,
+                        season_number
+                        INTEGER,
+                        release_year
+                        INTEGER,
+                        present
+                        INTEGER
+                        DEFAULT
+                        0, -- сколько фактически есть серий на диске
+                        total
+                        INTEGER
+                        DEFAULT
+                        0, -- сколько всего серий (present + missing)
+                        last_notified_present
+                        INTEGER
+                        DEFAULT
+                        0, -- до какого значения уже сообщали
+                        updated_at
+                        TEXT
+                    )
+                    """)
         # --- Мягкая миграция: добавляем колонку image_profiles, если её ещё нет
         try:
             cur.execute("ALTER TABLE media_quality ADD COLUMN image_profiles TEXT")
@@ -237,6 +277,8 @@ MESSAGES = {
         "audio_tracks": "Audio tracks",
         "image_profiles": "Image profiles",
         "quality_updated": "🔼Quality update🔼",
+        "season_added_progress": "Added {added} of {total} episodes",
+        "season_added_count_only": "Added {added} episodes",
     },
     "ru": {
         "new_movie_title": "🍿Новый фильм добавлен🍿",
@@ -253,6 +295,8 @@ MESSAGES = {
         "audio_tracks": "Аудио-дорожки",
         "image_profiles": "Профили изображения",
         "quality_updated": "🔼Обновление качества🔼",
+        "season_added_progress": "Добавлено {added} из {total} серий",
+        "season_added_count_only": "Добавлено {added} серий",
     }
 }
 #Выбираем рабочий язык: если заданный отсутствует в MESSAGES — ставим en
@@ -2362,6 +2406,320 @@ if FORCE_QUALITY_GC_ON_START:
         # вернём обычный grace для фоновой очистки
         QUALITY_GC_GRACE_DAYS = old_grace
 
+#Работа с сезонными уведомлениями
+def jellyfin_count_present_episodes_in_season(season_id: str) -> int | None:
+    """Только реально присутствующие эпизоды (есть физический файл)."""
+    try:
+        params = {
+            "api_key": JELLYFIN_API_KEY,
+            "ParentId": season_id,
+            "IncludeItemTypes": "Episode",
+            "Recursive": "false",
+            # ключ: считаем только файлы на диске
+            "LocationTypes": "FileSystem",
+            # на всякий случай исключим явно «виртуальные»
+            "IsMissing": "false",
+            "Limit": "1",  # TotalRecordCount учитывает фильтры
+        }
+        url = f"{JELLYFIN_BASE_URL}/emby/Items"
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json() or {}
+        cnt = data.get("TotalRecordCount")
+        return int(cnt) if isinstance(cnt, int) else len(data.get("Items") or [])
+    except Exception as ex:
+        logging.warning(f"Failed to count PRESENT episodes for season {season_id}: {ex}")
+        return None
+
+def jellyfin_count_missing_episodes_in_season(season_id: str) -> int | None:
+    """Эпизоды, которые есть в метаданных сезона, но файла нет (исключаем не вышедшие)."""
+    try:
+        params = {
+            "api_key": JELLYFIN_API_KEY,
+            "ParentId": season_id,
+            "IncludeItemTypes": "Episode",
+            "Recursive": "false",
+            # ключ: просим «пропущенные» (виртуальные) эпизоды
+            "IsMissing": "true",
+            "IsUnaired": "false",
+            "IsVirtualUnaired": "false",
+            # можно дополнительно ограничить расположение виртуальными объектами
+            "LocationTypes": "Virtual",
+            "Limit": "1",
+        }
+        url = f"{JELLYFIN_BASE_URL}/emby/Items"
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json() or {}
+        cnt = data.get("TotalRecordCount")
+        return int(cnt) if isinstance(cnt, int) else len(data.get("Items") or [])
+    except Exception as ex:
+        logging.warning(f"Failed to count MISSING episodes for season {season_id}: {ex}")
+        return None
+
+def jellyfin_get_season_counts_resilient(season_id: str) -> tuple[int, int]:
+    """
+    Возвращает (present, total) c короткими повторами.
+    total = present + missing. Если missing недоступен — total=present.
+    """
+    attempts = max(int(os.getenv("SEASON_EP_COUNT_RETRY_ATTEMPTS", "5")), 1)
+    delay = max(int(os.getenv("SEASON_EP_COUNT_RETRY_DELAY_SEC", "3")), 0)
+
+    present, total = 0, 0
+    for i in range(1, attempts + 1):
+        p = jellyfin_count_present_episodes_in_season(season_id)
+        m = jellyfin_count_missing_episodes_in_season(season_id)
+        present = int(p) if isinstance(p, int) else present
+        total = present + (int(m) if isinstance(m, int) else 0)
+
+        if total > 0 and (present > 0 or i == attempts):
+            if i > 1:
+                logging.debug(f"Season counts after {i} attempts: present={present}, total={total}")
+            break
+        time.sleep(delay)
+    return present, total
+
+def poll_recent_episodes_once():
+    """
+    Ищем свежие эпизоды постранично, группируем по сезону и шлём ОДНО уведомление «Новый сезон: добавлено N из M».
+    Свежие (моложе SERIES_POLL_GRACE_MIN) пропускаем — пусть их анонсирует вебхук.
+    """
+    page_size = SERIES_POLL_PAGE_SIZE
+    max_total = SERIES_POLL_MAX_TOTAL or 0  # 0 = без ограничения
+    start = 0
+    fetched = 0
+    now_utc = datetime.now(timezone.utc)
+
+    processed_seasons: set[str] = set()
+
+    while True:
+        # ограничим последнюю страницу при max_total
+        current_limit = page_size if (not max_total or (max_total - fetched) >= page_size) else (max_total - fetched)
+        if current_limit <= 0:
+            break
+
+        try:
+            params = {
+                "api_key": JELLYFIN_API_KEY,
+                "IncludeItemTypes": "Episode",
+                "Recursive": "true",
+                "SortBy": "DateCreated,DateModified",
+                "SortOrder": "Descending",
+                "Limit": str(current_limit),
+                "StartIndex": str(start),
+                "Fields": "ParentId,SeriesId,SeasonName,DateCreated,ProductionYear,Overview"
+            }
+            url = f"{JELLYFIN_BASE_URL}/emby/Items"
+            r = requests.get(url, params=params, timeout=20)
+            r.raise_for_status()
+            payload = r.json() or {}
+            items = payload.get("Items") or []
+        except Exception as ex:
+            logging.warning(f"Series poll: failed page start={start}: {ex}")
+            break
+
+        if not items:
+            break
+
+        # сгруппируем эпизоды по сезону
+        for ep in items:
+            try:
+                season_id = ep.get("ParentId") or ep.get("SeasonId")
+                if not season_id or season_id in processed_seasons:
+                    continue
+
+                # грейс: если эпизод совсем свежий — пропускаем сезон, пусть вебхук объявит
+                created_iso = ep.get("DateCreated")
+                created_dt = _parse_iso_utc(created_iso) if ' _parse_iso_utc' in globals() else None
+                if created_dt and (now_utc - created_dt) < timedelta(minutes=SERIES_POLL_GRACE_MIN):
+                    logging.debug(f"Series poll: skip fresh season (ep created {created_dt.isoformat()}) season={season_id}")
+                    continue
+
+                # получаем детали сезона/сериала
+                season_details = get_item_details(season_id)
+                s_item = (season_details.get("Items") or [{}])[0]
+                series_id = s_item.get("SeriesId")
+                season_name = s_item.get("Name") or ep.get("SeasonName") or "Season"
+                release_year = s_item.get("ProductionYear") or ep.get("ProductionYear")
+
+                series_details = get_item_details(series_id) if series_id else {"Items": [{}]}
+                series_item = (series_details.get("Items") or [{}])[0]
+                series_name = series_item.get("Name") or ""
+                overview_to_use = s_item.get("Overview") or series_item.get("Overview") or ""
+
+                # антиспам-ключ, как в вебхуке
+                series_name_cleaned = series_name.replace(f" ({release_year})", "").strip()
+                key_name = f"{series_name_cleaned} {season_name}".strip()
+
+                if item_already_notified("Season", key_name, release_year):
+                    processed_seasons.add(season_id)
+                    continue
+
+                # рейтинги/трейлер (опционально)
+                tmdb_id = jellyfin_get_tmdb_id(series_id) if 'jellyfin_get_tmdb_id' in globals() else None
+                trailer_url = get_youtube_trailer_url(f"{series_name_cleaned} Trailer {release_year}")
+
+                # считаем «сколько есть / сколько всего» по сезону (используй твой resilient-хелпер)
+                present, total = jellyfin_get_season_counts_resilient(season_id)
+
+                # 1) сохраняем «наблюдение» (без mark_notified) — чтобы иметь базу для следующего раза
+                _sp_upsert(
+                    season_id,
+                    present=present, total=total,
+                    series_id=series_id,
+                    season_number=int(s_item.get("IndexNumber")) if s_item.get("IndexNumber") is not None else None,
+                    series_name=series_name_cleaned,
+                    release_year=release_year,
+                    mark_notified=False
+                )
+
+                # 2) решаем, отправлять ли: только если present вырос со времени прошлого уведомления
+                if not _sp_should_notify(season_id, present):
+                    processed_seasons.add(season_id)
+                    continue
+
+                # 3) формируем сообщение
+                notification_message = (
+                    f"*{t('new_season_title')}*\n\n*{series_name_cleaned}* *({release_year})*\n\n"
+                    f"*{season_name}*"
+                )
+                if total >= present and total > 0:
+                    notification_message += f"\n\n{t('season_added_progress').format(added=present, total=total)}"
+                elif present > 0:
+                    notification_message += f"\n\n{t('season_added_count_only').format(added=present)}"
+                if overview_to_use:
+                    notification_message += f"\n\n{overview_to_use}"
+                if tmdb_id:
+                    ratings_text = fetch_mdblist_ratings("show", tmdb_id)
+                    if ratings_text:
+                        notification_message += f"\n\n*{t('new_ratings_show')}*\n{ratings_text}"
+                if trailer_url:
+                    notification_message += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
+
+                # 4) отправляем и фиксируем «до куда сообщили»
+                if _fetch_jellyfin_image_with_retries(season_id, attempts=1, timeout=3):
+                    send_notification(season_id, notification_message)
+                else:
+                    send_notification(series_id, notification_message)
+                    logging.warning(
+                        f"(Series poll) {series_name_cleaned} {season_name} image missing; using series image")
+
+                # помечаем прогресс: теперь last_notified_present = present
+                _sp_upsert(
+                    season_id,
+                    present=present, total=total,
+                    series_id=series_id,
+                    season_number=int(s_item.get("IndexNumber")) if s_item.get("IndexNumber") is not None else None,
+                    series_name=series_name_cleaned,
+                    release_year=release_year,
+                    mark_notified=True
+                )
+
+                logging.info(
+                    f"(Series poll) Season announced: {series_name_cleaned} {season_name} — {present} / {total}")
+                processed_seasons.add(season_id)
+
+            except Exception as ex:
+                logging.warning(f"Series poll: season from ep {ep.get('Id')} failed: {ex}")
+
+        n = len(items)
+        fetched += n
+        start += n
+        logging.debug(f"Series poll: page fetched {n} episodes (total {fetched})")
+        if n < current_limit:
+            break  # последняя страница
+
+def _series_poll_loop():
+    while True:
+        try:
+            poll_recent_episodes_once()
+        except Exception as ex:
+            logging.warning(f"Series poll loop error: {ex}")
+        time.sleep(SERIES_POLL_INTERVAL_SEC)
+
+if SERIES_POLL_ENABLED:
+    threading.Thread(target=_series_poll_loop, name="series-poll", daemon=True).start()
+    logging.info(f"Series polling enabled every {SERIES_POLL_INTERVAL_SEC}s "
+                 f"(page={SERIES_POLL_PAGE_SIZE}, max_total={SERIES_POLL_MAX_TOTAL}, grace={SERIES_POLL_GRACE_MIN}m)")
+
+def _sp_get(season_id: str) -> dict | None:
+    try:
+        conn = sqlite3.connect(QUALITY_DB_FILE)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT season_id, series_id, series_name, season_number, release_year,
+                   present, total, last_notified_present, updated_at
+            FROM season_progress WHERE season_id=?""", (season_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "season_id": row[0], "series_id": row[1], "series_name": row[2],
+            "season_number": row[3], "release_year": row[4],
+            "present": row[5], "total": row[6],
+            "last_notified_present": row[7], "updated_at": row[8],
+        }
+    except Exception as ex:
+        logging.warning(f"_sp_get failed: {ex}")
+        return None
+    finally:
+        try: conn.close()
+        except: pass
+
+def _sp_upsert(season_id: str, *, present: int, total: int,
+               series_id: str | None = None, season_number: int | None = None,
+               series_name: str | None = None, release_year: int | None = None,
+               mark_notified: bool = False):
+    try:
+        conn = sqlite3.connect(QUALITY_DB_FILE)
+        cur = conn.cursor()
+        nowz = datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
+        if mark_notified:
+            cur.execute("""
+                INSERT INTO season_progress (season_id, series_id, series_name, season_number, release_year,
+                                             present, total, last_notified_present, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(season_id) DO UPDATE SET
+                    series_id=excluded.series_id,
+                    series_name=excluded.series_name,
+                    season_number=excluded.season_number,
+                    release_year=excluded.release_year,
+                    present=excluded.present,
+                    total=excluded.total,
+                    last_notified_present=excluded.last_notified_present,
+                    updated_at=excluded.updated_at
+            """, (season_id, series_id, series_name, season_number, release_year,
+                  int(present), int(total), int(present), nowz))
+        else:
+            cur.execute("""
+                INSERT INTO season_progress (season_id, series_id, series_name, season_number, release_year,
+                                             present, total, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(season_id) DO UPDATE SET
+                    series_id=excluded.series_id,
+                    series_name=excluded.series_name,
+                    season_number=excluded.season_number,
+                    release_year=excluded.release_year,
+                    present=excluded.present,
+                    total=excluded.total,
+                    updated_at=excluded.updated_at
+            """, (season_id, series_id, series_name, season_number, release_year,
+                  int(present), int(total), nowz))
+        conn.commit()
+    except Exception as ex:
+        logging.warning(f"_sp_upsert failed: {ex}")
+    finally:
+        try: conn.close()
+        except: pass
+
+def _sp_should_notify(season_id: str, present_now: int) -> bool:
+    row = _sp_get(season_id)
+    if row is None:
+        # впервые видим сезон: слать только если разрешено и есть хоть что-то
+        return SERIES_POLL_INITIAL_ANNOUNCE and present_now > 0
+    last = int(row.get("last_notified_present") or 0)
+    return present_now > last
+
 
 
 
@@ -2528,9 +2886,19 @@ def announce_new_releases_from_jellyfin():
                 overview_to_use = payload.get("Overview") if payload.get("Overview") else series_details["Items"][0].get(
                     "Overview")
 
+                # считаем «сколько есть / сколько всего» по сезону (используй твой resilient-хелпер)
+                present, total = jellyfin_get_season_counts_resilient(season_id)
+
+                if total >= present and total > 0:
+                    episodes_segment = f"\n\n{t('season_added_progress').format(added=present, total=total)}"
+                elif present > 0:
+                    episodes_segment = f"\n\n{t('season_added_count_only').format(added=present)}"
+                else:
+                    episodes_segment = ""
+
                 notification_message = (
                     f"*{t('new_season_title')}*\n\n*{series_name_cleaned}* *({release_year})*\n\n"
-                    f"*{season}*\n\n{overview_to_use}")
+                    f"*{season}*{episodes_segment}\n\n{overview_to_use}")
 
                 if ratings_text:
                     notification_message += f"\n\n*{t('new_ratings_show')}*\n{ratings_text}"
