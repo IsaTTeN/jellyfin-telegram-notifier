@@ -2650,18 +2650,15 @@ def safe_fetch_mdblist_ratings(kind: str, tmdb_id: str | None) -> str:
 
 #Работа с сезонными уведомлениями
 def jellyfin_count_present_episodes_in_season(season_id: str) -> int | None:
-    """Только реально присутствующие эпизоды (есть физический файл)."""
     try:
         params = {
             "api_key": JELLYFIN_API_KEY,
             "ParentId": season_id,
             "IncludeItemTypes": "Episode",
             "Recursive": "false",
-            # ключ: считаем только файлы на диске
             "LocationTypes": "FileSystem",
-            # на всякий случай исключим явно «виртуальные»
             "IsMissing": "false",
-            "Limit": "1",  # TotalRecordCount учитывает фильтры
+            "Limit": "1",
         }
         url = f"{JELLYFIN_BASE_URL}/emby/Items"
         r = requests.get(url, params=params, timeout=10)
@@ -2669,23 +2666,27 @@ def jellyfin_count_present_episodes_in_season(season_id: str) -> int | None:
         data = r.json() or {}
         cnt = data.get("TotalRecordCount")
         return int(cnt) if isinstance(cnt, int) else len(data.get("Items") or [])
+    except requests.HTTPError as ex:
+        status = getattr(getattr(ex, "response", None), "status_code", None)
+        if status in (400, 404):
+            # сигнал «сезон удалён»
+            return -1
+        logging.warning(f"Failed to count PRESENT episodes for season {season_id}: {ex}")
+        return None
     except Exception as ex:
         logging.warning(f"Failed to count PRESENT episodes for season {season_id}: {ex}")
         return None
 
 def jellyfin_count_missing_episodes_in_season(season_id: str) -> int | None:
-    """Эпизоды, которые есть в метаданных сезона, но файла нет (исключаем не вышедшие)."""
     try:
         params = {
             "api_key": JELLYFIN_API_KEY,
             "ParentId": season_id,
             "IncludeItemTypes": "Episode",
             "Recursive": "false",
-            # ключ: просим «пропущенные» (виртуальные) эпизоды
             "IsMissing": "true",
             "IsUnaired": "false",
             "IsVirtualUnaired": "false",
-            # можно дополнительно ограничить расположение виртуальными объектами
             "LocationTypes": "Virtual",
             "Limit": "1",
         }
@@ -2695,31 +2696,50 @@ def jellyfin_count_missing_episodes_in_season(season_id: str) -> int | None:
         data = r.json() or {}
         cnt = data.get("TotalRecordCount")
         return int(cnt) if isinstance(cnt, int) else len(data.get("Items") or [])
+    except requests.HTTPError as ex:
+        status = getattr(getattr(ex, "response", None), "status_code", None)
+        if status in (400, 404):
+            # сигнал «сезон удалён»
+            return -1
+        logging.warning(f"Failed to count MISSING episodes for season {season_id}: {ex}")
+        return None
     except Exception as ex:
         logging.warning(f"Failed to count MISSING episodes for season {season_id}: {ex}")
         return None
 
-def jellyfin_get_season_counts_resilient(season_id: str) -> tuple[int, int]:
-    """
-    Возвращает (present, total) c короткими повторами.
-    total = present + missing. Если missing недоступен — total=present.
-    """
+def jellyfin_get_season_counts_resilient(season_id: str) -> tuple[int, int] | tuple[int, int, bool]:
     attempts = max(int(os.getenv("SEASON_EP_COUNT_RETRY_ATTEMPTS", "5")), 1)
     delay = max(int(os.getenv("SEASON_EP_COUNT_RETRY_DELAY_SEC", "3")), 0)
 
     present, total = 0, 0
     for i in range(1, attempts + 1):
         p = jellyfin_count_present_episodes_in_season(season_id)
+        if p == -1:
+            # сезон удалён — чистим прогресс и прекращаем
+            _sp_delete(season_id)
+            logging.info(f"Season {season_id} removed from Jellyfin — purged from DB.")
+            return (-1, -1)  # сигнал наверх
+
         m = jellyfin_count_missing_episodes_in_season(season_id)
-        present = int(p) if isinstance(p, int) else present
-        total = present + (int(m) if isinstance(m, int) else 0)
+        if m == -1:
+            _sp_delete(season_id)
+            logging.info(f"Season {season_id} removed from Jellyfin — purged from DB.")
+            return (-1, -1)
+
+        if isinstance(p, int):
+            present = p
+        if isinstance(m, int):
+            total = present + m
+        else:
+            total = present
 
         if total > 0 and (present > 0 or i == attempts):
             if i > 1:
                 logging.debug(f"Season counts after {i} attempts: present={present}, total={total}")
             break
         time.sleep(delay)
-    return present, total
+
+    return (present, total)
 
 def poll_recent_episodes_once():
     """
@@ -2801,6 +2821,10 @@ def poll_recent_episodes_once():
                 # в poll_recent_episodes_once(), прямо перед подсчётом present/total:
                 wait_until_scan_idle("season counts build")
                 present, total = jellyfin_get_season_counts_resilient(season_id)
+                # сезон удалён — пропускаем
+                if isinstance(present, int) and isinstance(total, int) and present == -1 and total == -1:
+                    processed_seasons.add(season_id)
+                    continue
 
                 # --- Срез по дате создания БД: baseline только ОДИН РАЗ, если сезона ещё нет в БД ---
                 row_existing = _sp_get(season_id)
@@ -3343,6 +3367,12 @@ def _season_fetch_episodes(season_id: str, *, max_items: int | None = None) -> l
                 break  # последняя страница
 
         return all_eps
+    except requests.HTTPError as ex:
+        status = getattr(getattr(ex, "response", None), "status_code", None)
+        if status in (400, 404):
+            return []  # сезон удалён — молча возвращаем пусто
+        logging.warning(f"_season_fetch_episodes failed (season {season_id}): {ex}")
+        return []
     except Exception as ex:
         logging.warning(f"_season_fetch_episodes failed (season {season_id}): {ex}")
         return []
@@ -3497,6 +3527,18 @@ def _parse_iso_dt(s: str | None):
         return datetime.fromisoformat(s.replace('Z', '+00:00'))
     except Exception:
         return None
+
+def _sp_delete(season_id: str):
+    try:
+        conn = sqlite3.connect(QUALITY_DB_FILE)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM season_progress WHERE season_id=?", (season_id,))
+        conn.commit()
+    except Exception as ex:
+        logging.warning(f"_sp_delete failed for {season_id}: {ex}")
+    finally:
+        try: conn.close()
+        except: pass
 
 
 @app.route("/webhook", methods=["POST"])
