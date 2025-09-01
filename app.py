@@ -1012,7 +1012,14 @@ def send_notification(photo_id, caption):
         if tg_response and tg_response.ok:
             logging.info("Notification sent via Telegram")
         else:
-            logging.warning("Notification failed via Telegram")
+            # ФОЛБЭК: разбиваем на два сообщения (фото -> текст)
+            logging.warning("Telegram (photo+caption) failed; trying split: photo-only then text…")
+            ok_photo = send_telegram_photo_only(photo_id)
+            ok_text  = send_telegram_text(caption)
+            if ok_photo and ok_text:
+                logging.info("Telegram split (photo then text) sent successfully")
+            else:
+                logging.warning("Telegram split fallback failed")
 #    tg_GOTIFY = send_gotify_message(photo_id, caption)
 
     # Gotify: только если параметры заданы
@@ -1200,6 +1207,69 @@ def send_telegram_photo(photo_id, caption):
     except Exception as ex:
         logging.warning(f"Error sending to Telegram: {ex}")
         return None
+
+def send_telegram_photo_only(photo_id):
+    """
+    Отправляет ТОЛЬКО фото (без caption) в Telegram.
+    Возвращает response при успехе, иначе None.
+    """
+    try:
+        image_bytes = _fetch_jellyfin_image_with_retries(photo_id, attempts=3, timeout=10, delay=1.5)
+        if not image_bytes:
+            logging.warning("Telegram(photo-only): Jellyfin image unavailable after retries")
+            return None
+
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        data = {"chat_id": TELEGRAM_CHAT_ID}
+        files = {'photo': ('photo.jpg', image_bytes, 'image/jpeg')}
+        resp = requests.post(url, data=data, files=files, timeout=30)
+        resp.raise_for_status()
+        logging.info("Telegram photo-only sent successfully")
+        return resp
+    except Exception as ex:
+        logging.warning(f"Telegram photo-only failed: {ex}")
+        return None
+
+
+def send_telegram_text(message: str):
+    """
+    Отправляет ТОЛЬКО текст в Telegram.
+    Сначала пробуем Markdown, при ошибке парсинга падаем в plain-text (очищенный).
+    Возвращает response при успехе, иначе None.
+    """
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return None
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        # Попытка №1: Markdown
+        resp = requests.post(url, data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "Markdown"
+        }, timeout=30)
+        if resp.ok:
+            logging.info("Telegram text sent (Markdown)")
+            return resp
+
+        # Если не ok — пробуем plain
+        logging.warning(f"Telegram text markdown failed: {resp.status_code} {resp.text}")
+        raise HTTPError(response=resp)
+
+    except Exception as md_ex:
+        try:
+            # Попытка №2: plain (очищаем markdown, ссылки приводим к простому виду)
+            plain = clean_markdown_for_apprise(message) or message
+            resp2 = requests.post(url, data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": plain
+            }, timeout=30)
+            resp2.raise_for_status()
+            logging.info("Telegram text sent (plain fallback)")
+            return resp2
+        except Exception as ex2:
+            logging.warning(f"Telegram text send failed: {ex2}")
+            return None
 
 def send_matrix_text_rest(message_markdown: str):
     """
