@@ -112,7 +112,7 @@ SERIES_POLL_PAGE_SIZE = int(os.getenv("SERIES_POLL_PAGE_SIZE", "500"))
 SERIES_POLL_MAX_TOTAL = int(os.getenv("SERIES_POLL_MAX_TOTAL", "0"))  # 0 = без ограничения
 SERIES_POLL_GRACE_MIN = int(os.getenv("SERIES_POLL_GRACE_MIN", "0"))  # свежие эпизоды отдаём на откуп вебхуку
 # Посылать ли уведомление при ПЕРВОМ обнаружении сезона (по умолчанию нет)
-SERIES_POLL_INITIAL_ANNOUNCE = os.getenv("SERIES_POLL_INITIAL_ANNOUNCE", "1").lower() in ("1","true","yes","on")
+SERIES_POLL_INITIAL_ANNOUNCE = os.getenv("SERIES_POLL_INITIAL_ANNOUNCE", "0").lower() in ("1","true","yes","on")
 # Блокировать таймеры отправки на время сканирования библиотеки Jellyfin
 NOTIFY_BLOCK_DURING_SCAN = os.getenv("NOTIFY_BLOCK_DURING_SCAN", "1").lower() in ("1","true","yes","on")
 SCAN_RECHECK_DELAY_SEC = int(os.getenv("SCAN_RECHECK_DELAY_SEC", "5"))   # пауза между проверками
@@ -147,6 +147,13 @@ notified_items_file = 'A:/git/notified_items.json'
 # === SQLite для качества (только для Movie на первом этапе) ===
 QUALITY_DB_FILE = os.path.join(os.path.dirname(notified_items_file), "media_quality.db")
 os.makedirs(os.path.dirname(QUALITY_DB_FILE), exist_ok=True)
+
+def _utcnow_iso() -> str:
+    """
+    Возвращает текущий момент в UTC в формате ISO 8601 c 'Z' на конце,
+    без микросекунд (например: 2025-08-31T19:45:00Z).
+    """
+    return datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
 
 def _init_quality_db():
     conn = sqlite3.connect(QUALITY_DB_FILE)
@@ -260,6 +267,23 @@ def _init_quality_db():
                         TEXT  -- ISO8601 UTC, когда обновляли
                     )
                     """)
+        # метаданные приложения/БД
+        cur.execute("""
+                    CREATE TABLE IF NOT EXISTS app_meta
+                    (
+                        key
+                        TEXT
+                        PRIMARY
+                        KEY,
+                        value
+                        TEXT
+                    )
+                    """)
+        # если нет штампа создания БД — проставим сейчас
+        cur.execute("SELECT value FROM app_meta WHERE key='db_created_at'")
+        row = cur.fetchone()
+        if not row:
+            cur.execute("INSERT INTO app_meta(key,value) VALUES('db_created_at', ?)", (_utcnow_iso(),))
         # --- Мягкая миграция: добавляем колонку image_profiles, если её ещё нет
         try:
             cur.execute("ALTER TABLE media_quality ADD COLUMN image_profiles TEXT")
@@ -2778,6 +2802,40 @@ def poll_recent_episodes_once():
                 wait_until_scan_idle("season counts build")
                 present, total = jellyfin_get_season_counts_resilient(season_id)
 
+                # --- Срез по дате создания БД: baseline только ОДИН РАЗ, если сезона ещё нет в БД ---
+                row_existing = _sp_get(season_id)
+                if row_existing is None:
+                    try:
+                        db_created_iso = _db_get_created_at_iso()
+                        db_created_dt = _parse_iso_dt(db_created_iso)
+
+                        # DateCreated у сезона берём из уже полученного s_item; если вдруг нет — дёрнем детали
+                        season_created_iso = s_item.get("DateCreated")
+                        if not season_created_iso:
+                            s_det_fallback = get_item_details(season_id)
+                            season_created_iso = ((s_det_fallback.get("Items") or [{}])[0]).get("DateCreated")
+                        season_created_dt = _parse_iso_dt(season_created_iso)
+
+                        if db_created_dt and season_created_dt and (season_created_dt < db_created_dt):
+                            # Сезон был ДО создания БД — пишем baseline и НЕ шлём уведомление
+                            _sp_upsert(
+                                season_id,
+                                present=present, total=total,
+                                series_id=series_id,
+                                season_number=int(s_item.get("IndexNumber")) if s_item.get(
+                                    "IndexNumber") is not None else None,
+                                series_name=series_name_cleaned,
+                                release_year=release_year,
+                                mark_notified=True  # baseline: сразу считаем «объявленным»
+                            )
+                            logging.info(
+                                f"(Series poll) Season pre-DB cutoff baseline: {series_name_cleaned} {season_name} — {present}/{total}")
+                            processed_seasons.add(season_id)
+                            continue
+                    except Exception as ex:
+                        logging.warning(f"Season cutoff check failed for {season_id}: {ex}")
+                # --- конец среза ---
+
                 # 1) сохраняем «наблюдение» (без mark_notified) — чтобы иметь базу для следующего раза
                 _sp_upsert(
                     season_id,
@@ -2800,7 +2858,7 @@ def poll_recent_episodes_once():
                 # рейтинги/трейлер (опционально)
                 tmdb_id = jellyfin_get_tmdb_id(series_id) if 'jellyfin_get_tmdb_id' in globals() else None
                 trailer_url = safe_get_trailer_prefer_tmdb(f"{series_name_cleaned} Trailer {release_year}",
-                                context="series_poll", subkind="show", tmdb_id=tmdb_id)
+                                subkind="show", tmdb_id=tmdb_id, context="")
 
                 # 3) формируем сообщение
                 notification_message = (
@@ -3383,6 +3441,28 @@ def _normalize_audio_label(label: str) -> str:
     s = re.sub(r"\s+", " ", s)                # схлопнуть пробелы
     return s.casefold()                        # регистронезависимо
 
+#Контроль базы данных (дата создания)
+def _db_get_created_at_iso() -> str | None:
+    try:
+        conn = sqlite3.connect(QUALITY_DB_FILE)
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM app_meta WHERE key='db_created_at'")
+        row = cur.fetchone()
+        return row[0] if row else None
+    except Exception as ex:
+        logging.warning(f"db_created_at read failed: {ex}")
+        return None
+    finally:
+        try: conn.close()
+        except: pass
+
+def _parse_iso_dt(s: str | None):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace('Z', '+00:00'))
+    except Exception:
+        return None
 
 
 @app.route("/webhook", methods=["POST"])
@@ -3535,11 +3615,10 @@ def announce_new_releases_from_jellyfin():
                 # Remove release_year from series_name if present
                 series_name_cleaned = series_name.replace(f" ({release_year})", "").strip()
 
-                trailer_url = safe_get_trailer_prefer_tmdb(f"{series_name_cleaned} Trailer {release_year}",
-                                context="series_poll", subkind="show", tmdb_id=tmdb_id)
-
                 # Get TMDb ID via external API
                 tmdb_id = jellyfin_get_tmdb_id(series_id)
+                trailer_url = safe_get_trailer_prefer_tmdb(f"{series_name_cleaned} Trailer {release_year}",
+                                subkind="show", tmdb_id=tmdb_id, context="")
 
                 # **Новые строки**: получаем рейтинги для сериала
                 ratings_text = safe_fetch_mdblist_ratings("show", tmdb_id)
