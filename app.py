@@ -2957,41 +2957,75 @@ def _sp_upsert(season_id: str, *, present: int, total: int,
                series_id: str | None = None, season_number: int | None = None,
                series_name: str | None = None, release_year: int | None = None,
                mark_notified: bool = False):
+    """
+    Записывает прогресс сезона ТОЛЬКО при фактических изменениях.
+    - без mark_notified: обновляем, если изменились present/total
+    - с mark_notified: дополнительно пишем last_notified_present=present (если отличается)
+    Это предотвращает бессмысленные перезаписи и «мигание» mtime у файла БД.
+    """
     try:
         conn = sqlite3.connect(QUALITY_DB_FILE)
         cur = conn.cursor()
         nowz = datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
-        if mark_notified:
-            cur.execute("""
-                INSERT INTO season_progress (season_id, series_id, series_name, season_number, release_year,
-                                             present, total, last_notified_present, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(season_id) DO UPDATE SET
-                    series_id=excluded.series_id,
-                    series_name=excluded.series_name,
-                    season_number=excluded.season_number,
-                    release_year=excluded.release_year,
-                    present=excluded.present,
-                    total=excluded.total,
-                    last_notified_present=excluded.last_notified_present,
-                    updated_at=excluded.updated_at
-            """, (season_id, series_id, series_name, season_number, release_year,
-                  int(present), int(total), int(present), nowz))
+
+        # читаем текущее состояние
+        cur.execute("""
+            SELECT present, total, last_notified_present
+            FROM season_progress WHERE season_id=?
+        """, (season_id,))
+        row = cur.fetchone()
+
+        if row:
+            old_present, old_total, old_last = (row[0] or 0), (row[1] or 0), (row[2] or 0)
+
+            # решаем, нужно ли писать
+            need_update = False
+            set_last = None
+
+            if present != old_present or total != old_total:
+                need_update = True
+            if mark_notified and old_last != present:
+                need_update = True
+                set_last = present
+
+            if not need_update:
+                # ничего не изменилось — выходим без записи
+                return
+
+            if mark_notified:
+                cur.execute("""
+                    UPDATE season_progress
+                    SET present=?, total=?, last_notified_present=?, updated_at=?,
+                        series_id=COALESCE(?, series_id),
+                        series_name=COALESCE(?, series_name),
+                        season_number=COALESCE(?, season_number),
+                        release_year=COALESCE(?, release_year)
+                    WHERE season_id=?
+                """, (present, total, (set_last if set_last is not None else old_last), nowz,
+                      series_id, series_name, season_number, release_year, season_id))
+            else:
+                cur.execute("""
+                    UPDATE season_progress
+                    SET present=?, total=?, updated_at=?,
+                        series_id=COALESCE(?, series_id),
+                        series_name=COALESCE(?, series_name),
+                        season_number=COALESCE(?, season_number),
+                        release_year=COALESCE(?, release_year)
+                    WHERE season_id=?
+                """, (present, total, nowz,
+                      series_id, series_name, season_number, release_year, season_id))
         else:
+            # первая запись по сезону
             cur.execute("""
-                INSERT INTO season_progress (season_id, series_id, series_name, season_number, release_year,
-                                             present, total, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(season_id) DO UPDATE SET
-                    series_id=excluded.series_id,
-                    series_name=excluded.series_name,
-                    season_number=excluded.season_number,
-                    release_year=excluded.release_year,
-                    present=excluded.present,
-                    total=excluded.total,
-                    updated_at=excluded.updated_at
+                INSERT INTO season_progress (
+                    season_id, series_id, series_name, season_number, release_year,
+                    present, total, last_notified_present, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (season_id, series_id, series_name, season_number, release_year,
-                  int(present), int(total), nowz))
+                  int(present), int(total),
+                  int(present) if mark_notified else 0,
+                  nowz))
         conn.commit()
     except Exception as ex:
         logging.warning(f"_sp_upsert failed: {ex}")
