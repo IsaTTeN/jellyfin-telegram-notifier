@@ -128,6 +128,10 @@ RATINGS_CACHE_TTL_DAYS = int(os.getenv("RATINGS_CACHE_TTL_DAYS", "14"))
 # Пределы для блока аудио-дорожек у сезонов
 SEASON_AUDIO_TRACKS_MAX = int(os.getenv("SEASON_AUDIO_TRACKS_MAX", "12"))   # максимум уникальных дорожек
 SEASON_AUDIO_SCAN_LIMIT = int(os.getenv("SEASON_AUDIO_SCAN_LIMIT", "50"))   # максимум серий для сканирования (present)
+#Для whatsapp повторные отправки
+WHATSAPP_IMAGE_RETRY_ATTEMPTS = int(os.getenv("WHATSAPP_IMAGE_RETRY_ATTEMPTS", "3"))
+WHATSAPP_IMAGE_RETRY_DELAY_SEC = int(os.getenv("WHATSAPP_IMAGE_RETRY_DELAY_SEC", "2"))
+
 
 # Глобальные переменные
 imgbb_upload_done = threading.Event()   # Сигнал о завершении загрузки
@@ -1092,20 +1096,22 @@ def send_notification(photo_id, caption):
     except Exception as em_ex:
         logging.warning(f"Email send failed: {em_ex}")
 
-    # ======= WHATSAPP: отправляем картинку с подписью =======
+    # ======= WHATSAPP: сначала картинка с подписью (с ретраями), при провале — текст =======
     try:
         wa_jid = _wa_get_jid_from_env()
         if WHATSAPP_API_URL and wa_jid:
-            # view_once, compress, duration, is_forwarded возьмутся из дефолтов
-            send_whatsapp_image_via_rest(
+            ok_img = send_whatsapp_image_with_retries(
                 caption=caption,
                 phone_jid=wa_jid,
                 image_url=uploaded_url
             )
+            if not ok_img:
+                logging.warning("WhatsApp image failed after retries; sending text-only fallback")
+                send_whatsapp_text_via_rest(caption, phone_jid=wa_jid)
         else:
-            logging.debug("WhatsApp disabled or no JID; skip image send.")
+            logging.debug("WhatsApp disabled or no JID; skip WhatsApp send.")
     except Exception as wa_ex:
-        logging.warning(f"WhatsApp image send failed: {wa_ex}")
+        logging.warning(f"WhatsApp send block failed: {wa_ex}")
 
     other_services = [url for url in APPRISE_URLS.split() if url]  # убираем пустые строки
     if other_services:
@@ -1539,7 +1545,6 @@ def send_whatsapp_image_via_rest(
     caption: str,
     phone_jid: str = None,
     image_url: str = None,
-#    photo_id: str = None,   # теперь необязательный
     view_once: bool = False,
     compress: bool = False,
     duration: int = 0,
@@ -1587,6 +1592,72 @@ def send_whatsapp_image_via_rest(
     except requests.exceptions.RequestException as e:
         logging.warning(f"Error sending WhatsApp image: {e}")
         return None
+
+def send_whatsapp_text_via_rest(message: str, phone_jid: str | None = None):
+    """
+    Шлёт ТОЛЬКО текст. Сначала /send/text, при 404 — /send/message.
+    Возвращает response или None.
+    """
+    if not WHATSAPP_API_URL:
+        logging.debug("WhatsApp API URL not set; skip text.")
+        return None
+
+    phone_jid = phone_jid or _wa_get_jid_from_env()
+    if not phone_jid:
+        logging.debug("WhatsApp JID empty; skip text.")
+        return None
+
+    base = WHATSAPP_API_URL.rstrip("/")
+    url_text = f"{base}/send/text"
+    url_msg  = f"{base}/send/message"
+    auth = (WHATSAPP_API_USERNAME, WHATSAPP_API_PWD) if (WHATSAPP_API_USERNAME or WHATSAPP_API_PWD) else None
+
+    form = {
+        "phone": phone_jid,
+        "message": sanitize_whatsapp_text(message or "")
+    }
+
+    try:
+        r = requests.post(url_text, data=form, auth=auth, timeout=20)
+        if r.status_code == 404:
+            r = requests.post(url_msg, data=form, auth=auth, timeout=20)
+        r.raise_for_status()
+        logging.info("WhatsApp text sent successfully")
+        return r
+    except Exception as ex:
+        logging.warning(f"WhatsApp text send failed: {ex}")
+        return None
+
+def send_whatsapp_image_with_retries(
+    caption: str,
+    phone_jid: str | None,
+    image_url: str | None = None
+) -> bool:
+    """
+    Пытается отправить изображение с подписью несколько раз.
+    True при успехе, False если все попытки провалились.
+    """
+    attempts = max(1, WHATSAPP_IMAGE_RETRY_ATTEMPTS)
+    delay = max(0, WHATSAPP_IMAGE_RETRY_DELAY_SEC)
+
+    for i in range(1, attempts + 1):
+        try:
+            resp = send_whatsapp_image_via_rest(
+                caption=caption,
+                phone_jid=phone_jid,
+                image_url=image_url
+            )
+            ok = (resp is not None) and (getattr(resp, "ok", True))
+            if ok:
+                logging.info(f"WhatsApp image sent on attempt {i}")
+                return True
+            else:
+                logging.warning(f"WhatsApp image attempt {i} failed (no/negative response)")
+        except Exception as ex:
+            logging.warning(f"WhatsApp image attempt {i} exception: {ex}")
+        if i < attempts:
+            time.sleep(delay)
+    return False
 
 
 def get_item_details(item_id):
