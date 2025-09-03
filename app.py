@@ -20,6 +20,7 @@ from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, timedelta, timezone
 from collections import Counter, OrderedDict
 import sqlite3
+import hashlib
 
 load_dotenv()
 app = Flask(__name__)
@@ -131,6 +132,12 @@ SEASON_AUDIO_SCAN_LIMIT = int(os.getenv("SEASON_AUDIO_SCAN_LIMIT", "50"))   # м
 #Для whatsapp повторные отправки
 WHATSAPP_IMAGE_RETRY_ATTEMPTS = int(os.getenv("WHATSAPP_IMAGE_RETRY_ATTEMPTS", "3"))
 WHATSAPP_IMAGE_RETRY_DELAY_SEC = int(os.getenv("WHATSAPP_IMAGE_RETRY_DELAY_SEC", "2"))
+# --- Episode/Season quality polling (по сериям -> уведомление на сезон) ---
+EP_QUALITY_POLL_ENABLED = (os.getenv("EP_QUALITY_POLL_ENABLED", "1").lower() in ("1","true","yes","on"))
+EP_QUALITY_POLL_INTERVAL_SEC = int(os.getenv("EP_QUALITY_POLL_INTERVAL_SEC", "90"))
+EP_QUALITY_POLL_PAGE_SIZE = int(os.getenv("EP_QUALITY_POLL_PAGE_SIZE", "500"))
+EP_QUALITY_POLL_MAX_TOTAL = int(os.getenv("EP_QUALITY_POLL_MAX_TOTAL", "0"))  # 0 = без ограничения
+# Для "свежих" эпизодов можно переиспользовать SERIES_POLL_GRACE_MIN
 
 
 # Глобальные переменные
@@ -283,6 +290,31 @@ def _init_quality_db():
                         TEXT
                     )
                     """)
+        cur.execute("""
+                    CREATE TABLE IF NOT EXISTS season_quality
+                    (
+                        season_id
+                        TEXT
+                        PRIMARY
+                        KEY,
+                        series_id
+                        TEXT,
+                        series_name
+                        TEXT,
+                        season_number
+                        INTEGER,
+                        release_year
+                        INTEGER,
+                        signature
+                        TEXT, -- агрегированный снимок качества по доступным эпизодам
+                        updated_at
+                        TEXT  -- ISO
+                    )""")
+        # Миграция: добавим episode_count, если столбца нет
+        cur.execute("PRAGMA table_info(season_quality)")
+        cols = {r[1] for r in cur.fetchall()}
+        if "episode_count" not in cols:
+            cur.execute("ALTER TABLE season_quality ADD COLUMN episode_count INTEGER")
         # если нет штампа создания БД — проставим сейчас
         cur.execute("SELECT value FROM app_meta WHERE key='db_created_at'")
         row = cur.fetchone()
@@ -3094,6 +3126,65 @@ if SERIES_POLL_ENABLED:
     logging.info(f"Series polling enabled every {SERIES_POLL_INTERVAL_SEC}s "
                  f"(page={SERIES_POLL_PAGE_SIZE}, max_total={SERIES_POLL_MAX_TOTAL}, grace={SERIES_POLL_GRACE_MIN}m)")
 
+
+def _sq_get(season_id: str) -> dict | None:
+    try:
+        conn = sqlite3.connect(QUALITY_DB_FILE)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT season_id, series_id, series_name, season_number, release_year, signature, updated_at, episode_count
+            FROM season_quality WHERE season_id=?""", (season_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "season_id": row[0],
+            "series_id": row[1],
+            "series_name": row[2],
+            "season_number": row[3],
+            "release_year": row[4],
+            "signature": row[5],
+            "updated_at": row[6],
+            "episode_count": row[7],
+        }
+    except Exception as ex:
+        logging.warning(f"_sq_get failed: {ex}")
+        return None
+    finally:
+        try: conn.close()
+        except: pass
+
+
+def _sq_upsert(season_id: str, *, signature: str,
+               episode_count: int | None,
+               series_id: str | None = None,
+               series_name: str | None = None,
+               season_number: int | None = None,
+               release_year: int | None = None):
+    try:
+        conn = sqlite3.connect(QUALITY_DB_FILE)
+        cur = conn.cursor()
+        nowz = datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
+        cur.execute("""
+            INSERT INTO season_quality (season_id, series_id, series_name, season_number, release_year, signature, updated_at, episode_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(season_id) DO UPDATE SET
+              signature=excluded.signature,
+              updated_at=excluded.updated_at,
+              episode_count=excluded.episode_count,
+              series_id=COALESCE(excluded.series_id, season_quality.series_id),
+              series_name=COALESCE(excluded.series_name, season_quality.series_name),
+              season_number=COALESCE(excluded.season_number, season_quality.season_number),
+              release_year=COALESCE(excluded.release_year, season_quality.release_year)
+        """, (season_id, series_id, series_name, season_number, release_year, signature, nowz, episode_count))
+        conn.commit()
+    except Exception as ex:
+        logging.warning(f"_sq_upsert failed: {ex}")
+    finally:
+        try: conn.close()
+        except: pass
+
+
 def _sp_get(season_id: str) -> dict | None:
     try:
         conn = sqlite3.connect(QUALITY_DB_FILE)
@@ -3680,6 +3771,252 @@ def _sp_delete(season_id: str):
     finally:
         try: conn.close()
         except: pass
+
+#Уведомление об обновлении сезонов
+def _episode_media_quality_signature_from_ep(ep: dict) -> str:
+    """
+    Строит сигнатуру качества эпизода по первому MediaSource (без сетевых запросов).
+    """
+    try:
+        sources = ep.get("MediaSources") or []
+        if not sources:
+            return ""
+        src = sources[0]
+        streams = src.get("MediaStreams") or []
+
+        v = next((s for s in streams if s.get("Type")=="Video"), None)
+        a = next((s for s in streams if s.get("Type")=="Audio"), None)
+
+        q = {}
+        # контейнер/размер/битрейт
+        q["container"] = (src.get("Container") or "").lower()
+        try: q["size_bytes"] = int(src.get("Size") or 0)
+        except Exception: q["size_bytes"] = 0
+        try: q["video_bitrate_kbps"] = int((src.get("Bitrate") or 0)) // 1000
+        except Exception: q["video_bitrate_kbps"] = None
+
+        if v:
+            q["video_codec"] = (v.get("Codec") or "").lower()
+            q["width"]  = v.get("Width") or v.get("PixelWidth")
+            q["height"] = v.get("Height") or v.get("PixelHeight")
+            q["bit_depth"] = v.get("BitDepth")
+            # fps
+            fps = v.get("RealFrameRate") or v.get("AverageFrameRate") or v.get("FrameRate")
+            try: q["fps"] = float(fps) if fps is not None else None
+            except Exception: q["fps"] = None
+            # профили HDR/DV
+            q["image_profiles"] = _detect_image_profiles_from_fields(v)
+
+        if a:
+            q["audio_codec"] = (a.get("Codec") or "").lower()
+            try: q["audio_channels"] = int(a.get("Channels") or 0)
+            except Exception: q["audio_channels"] = None
+            try: q["audio_bitrate_kbps"] = int((a.get("BitRate") or 0)) // 1000
+            except Exception: q["audio_bitrate_kbps"] = None
+
+        sig = _quality_signature(q)  # используем вашу нормализацию
+        return sig or ""
+    except Exception as ex:
+        logging.debug(f"episode quality signature failed: {ex}")
+        return ""
+
+def _season_quality_signature(season_id: str, *, scan_limit: int | None = None) -> str:
+    """
+    Агрегированная сигнатура сезона = sha1 от отсортированного списка сигнатур эпизодов (с файлами).
+    """
+    eps = _season_fetch_episodes(season_id)
+    present_eps = [ep for ep in eps if _episode_has_file(ep)]
+    lim = max(int(globals().get("SEASON_QUALITY_SIG_LIMIT", 80)), 1)
+    if scan_limit is not None:
+        lim = max(int(scan_limit), 1)
+
+    sigs = []
+    for ep in present_eps[:lim]:
+        s = _episode_media_quality_signature_from_ep(ep)
+        if s:
+            sigs.append(s)
+
+    if not sigs:
+        return ""
+
+    sigs.sort()
+    joined = "||".join(sigs).encode("utf-8", errors="ignore")
+    return hashlib.sha1(joined).hexdigest()
+
+
+def _season_quality_snapshot(season_id: str, *, scan_limit: int | None = None) -> tuple[str, int]:
+    sig = _season_quality_signature(season_id, scan_limit=scan_limit)
+    eps = _season_fetch_episodes(season_id)
+    present = len([ep for ep in eps if _episode_has_file(ep)])
+    return (sig, present)
+
+def _notify_season_quality_updated(season_id: str):
+    # детали сезона/сериала
+    season_details = get_item_details(season_id)
+    s_item = (season_details.get("Items") or [{}])[0]
+    series_id = s_item.get("SeriesId")
+    season_name = s_item.get("Name") or "Season"
+    release_year = s_item.get("ProductionYear")
+
+    series_details = get_item_details(series_id) if series_id else {"Items":[{}]}
+    series_item = (series_details.get("Items") or [{}])[0]
+    series_name = series_item.get("Name") or ""
+    overview = s_item.get("Overview") or series_item.get("Overview") or ""
+
+    series_name_cleaned = series_name.replace(f" ({release_year})","").strip()
+
+    # рейтинги + трейлер
+    tmdb_id = jellyfin_get_tmdb_id(series_id) if 'jellyfin_get_tmdb_id' in globals() else None
+    trailer_url = safe_get_trailer_prefer_tmdb(f"{series_name_cleaned} Trailer {release_year}",
+                                               subkind="show", tmdb_id=tmdb_id, context="")
+
+    msg = f"*{t('quality_updated')}*\n\n*{series_name_cleaned}* *({release_year})*\n\n*{season_name}*"
+    if overview:
+        msg += f"\n\n{overview}"
+    if tmdb_id:
+        ratings_text = safe_fetch_mdblist_ratings("show", tmdb_id)
+        if ratings_text:
+            msg += f"\n\n*{t('new_ratings_show')}*\n{ratings_text}"
+    if trailer_url:
+        msg += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
+
+    if INCLUDE_AUDIO_TRACKS:
+        tracks_block = build_audio_tracks_block_for_season(season_id)
+        if tracks_block:
+            msg += tracks_block
+
+    # постер сезона, если нет — постер сериала
+    if _fetch_jellyfin_image_with_retries(season_id, attempts=1, timeout=3):
+        send_notification(season_id, msg)
+    else:
+        send_notification(series_id, msg)
+        logging.warning(f"(EpQuality poll) season image missing; used series image for {series_name_cleaned} {season_name}")
+
+def _maybe_notify_season_quality_change(season_id: str) -> bool:
+    # Текущий снимок
+    new_sig, new_count = _season_quality_snapshot(season_id)
+    if not new_sig:
+        return False  # ждём, когда Jellyfin отдаст MediaSources/файлы
+
+    row = _sq_get(season_id)
+    if row is None:
+        # Baseline: фиксируем сигнатуру и count, без уведомления
+        try:
+            sd = get_item_details(season_id)
+            s_item = (sd.get("Items") or [{}])[0]
+            _sq_upsert(
+                season_id,
+                signature=new_sig,
+                episode_count=new_count,
+                series_id=s_item.get("SeriesId"),
+                series_name=None,
+                season_number=int(s_item.get("IndexNumber")) if s_item.get("IndexNumber") is not None else None,
+                release_year=s_item.get("ProductionYear"),
+            )
+        except Exception:
+            _sq_upsert(season_id, signature=new_sig, episode_count=new_count)
+        return False
+
+    old_sig = row.get("signature") or ""
+    old_count = row.get("episode_count")
+    # 1) Если изменилось число эпизодов в сезоне — обновляем baseline и выходим БЕЗ уведомления
+    if (old_count is None) or (old_count != new_count):
+        _sq_upsert(season_id, signature=new_sig, episode_count=new_count)
+        logging.info(f"(EpQuality) suppressed due to episode_count change: {old_count} -> {new_count} for season {season_id}")
+        return False
+
+    # 2) Если сигнатура не изменилась — выходим
+    if old_sig == new_sig:
+        return False
+
+    # 3) Чистое изменение качества при стабильном числе эпизодов — отправляем уведомление
+    _notify_season_quality_updated(season_id)
+    _sq_upsert(season_id, signature=new_sig, episode_count=new_count)
+    return True
+
+_last_epq_since = datetime.now(timezone.utc)
+
+def poll_episode_quality_once():
+    """
+    Ищем эпизоды по DateModified (самые свежие изменения), собираем уникальные сезоны,
+    и для каждого сезона проверяем изменения агрегированного качества.
+    Новые (очень свежие) эпизоды пропускаем — их анонсирует вебхук/серийный поллер.
+    """
+    page_size = EP_QUALITY_POLL_PAGE_SIZE
+    max_total = EP_QUALITY_POLL_MAX_TOTAL or 0
+    start = 0
+    fetched = 0
+    now_utc = datetime.now(timezone.utc)
+    processed_seasons: set[str] = set()
+    triggered = 0
+
+    while True:
+        current_limit = page_size if (not max_total or (max_total - fetched) >= page_size) else (max_total - fetched)
+        if current_limit <= 0:
+            break
+        try:
+            params = {
+                "api_key": JELLYFIN_API_KEY,
+                "IncludeItemTypes": "Episode",
+                "Recursive": "true",
+                "SortBy": "DateModified,DateCreated",
+                "SortOrder": "Descending",
+                "Limit": str(current_limit),
+                "StartIndex": str(start),
+                "Fields": "ParentId,DateCreated"
+            }
+            url = f"{JELLYFIN_BASE_URL}/emby/Items"
+            r = requests.get(url, params=params, timeout=20)
+            r.raise_for_status()
+            payload = r.json() or {}
+            items = payload.get("Items") or []
+        except Exception as ex:
+            logging.warning(f"EpQuality poll: failed page start={start}: {ex}")
+            break
+
+        if not items:
+            break
+
+        for it in items:
+            season_id = it.get("ParentId") or it.get("SeasonId")
+            if not season_id or season_id in processed_seasons:
+                continue
+
+            # грейс для «совсем новых» эпизодов
+            created_iso = it.get("DateCreated")
+            created_dt = _parse_iso_utc(created_iso)
+            if created_dt and (now_utc - created_dt) < timedelta(minutes=SERIES_POLL_GRACE_MIN):
+                continue
+
+            try:
+                if _maybe_notify_season_quality_change(season_id):
+                    triggered += 1
+                processed_seasons.add(season_id)
+            except Exception as ex:
+                logging.warning(f"EpQuality poll: season {season_id} failed: {ex}")
+
+        n = len(items)
+        fetched += n
+        start += n
+        if n < current_limit:
+            break  # последняя страница
+
+    global _last_epq_since
+#    logging.info(f"(EpQuality poll) processed={len(processed_seasons)}, triggered={triggered}, since={_last_epq_since.isoformat()}")
+    _last_epq_since = now_utc
+
+def _ep_quality_poll_loop():
+    while True:
+        try:
+            poll_episode_quality_once()
+        except Exception as ex:
+            logging.warning(f"EpQuality poll loop error: {ex}")
+        time.sleep(EP_QUALITY_POLL_INTERVAL_SEC)
+
+if EP_QUALITY_POLL_ENABLED:
+    threading.Thread(target=_ep_quality_poll_loop, name="ep-quality-poll", daemon=True).start()
+    logging.info(f"Episode/Season quality polling enabled every {EP_QUALITY_POLL_INTERVAL_SEC}s "
+                 f"(page={EP_QUALITY_POLL_PAGE_SIZE}, max_total={EP_QUALITY_POLL_MAX_TOTAL}, grace={SERIES_POLL_GRACE_MIN}m)")
 
 
 @app.route("/webhook", methods=["POST"])
