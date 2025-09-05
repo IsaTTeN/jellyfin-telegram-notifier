@@ -1,3 +1,5 @@
+  <h1> The project is under active revision. There will be a new description and new features soon. </h1>
+
 <div align="center">
   <img src="readme_images/JTN.png" alt="Jellyfin Notification System" width="512">
   <h1>Jellyfin Notification System</h1>
