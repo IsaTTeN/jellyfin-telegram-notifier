@@ -84,7 +84,7 @@ SMTP_USE_SSL = os.environ.get("SMTP_USE_SSL", "0") in ("1", "true", "True")   # 
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "")   # ID канала, например C0123456789
 #выключение контроля добавленного контента
-DISABLE_DEDUP = os.getenv("NOTIFIER_DISABLE_DEDUP", "1").lower() in ("1", "true", "yes")
+DISABLE_DEDUP = os.getenv("NOTIFIER_DISABLE_DEDUP", "0").lower() in ("1", "true", "yes")
 #настройки для фильмов
 MOVIE_POLL_ENABLED = os.getenv("MOVIE_POLL_ENABLED", "1").lower() in ("1", "true", "yes")
 MOVIE_POLL_INTERVAL_SEC = int(os.getenv("MOVIE_POLL_INTERVAL_SEC", "80"))   # каждые 5 минут
@@ -2286,11 +2286,7 @@ def poll_recent_movies_once():
         for it in items:
             try:
                 # --- грейс: свежие новинки не трогаем (пусть вебхук пошлёт 'New Movie Added')
-                created_iso = it.get("DateCreated")
-                created_dt = _parse_iso_utc(created_iso)
-                if created_dt and (now_utc - created_dt) < timedelta(minutes=MOVIE_POLL_GRACE_MIN):
-                    logging.debug(f"Movie poll: skip fresh item (created {created_dt.isoformat()}): {it.get('Name')}")
-                    continue
+
                 # -------------------------------------------------------------
 
                 item_id = it.get("Id")
@@ -2320,6 +2316,107 @@ def poll_recent_movies_once():
                 if sent:
                     # запись в БД уже обновлена; повтора на следующем проходе не будет
                     continue
+
+                # --- NEW: если это «новый фильм» и по нему ещё не было анонса — шлём «New Movie Added»
+                if not item_already_notified("Movie", name, year):
+                    logical_key = _movie_logical_key(
+                        tmdb_id=tmdb_id,
+                        imdb_id=imdb_id,
+                        name=name_clean,
+                        year=year
+                    )
+                    # Если только что был quality-update — не дублируем «новый фильм»
+                    if was_quality_update_recent(logical_key):
+                        logging.info(
+                            f"(Movie poll) Suppressed 'new movie' due to recent quality update (logical_key={logical_key})")
+                    else:
+                        # --- Cutoff: skip "new movie" announce for films added BEFORE DB creation; mark as baseline-notified
+                        try:
+                            db_created_iso = _db_get_created_at_iso()
+                            db_created_dt = _parse_iso_dt(db_created_iso)
+                            created_iso = it.get("DateCreated")
+                            created_dt = _parse_iso_dt(created_iso)
+                            if db_created_dt and created_dt and (created_dt < db_created_dt):
+                                # baseline: считаем уже «объявленным», чтобы дальше слать только апгрейды качества
+                                mark_item_as_notified("Movie", name, year)
+                                logging.info(
+                                    f"(Movie poll) Pre-DB cutoff baseline: {name_clean} ({year}) — suppressed new-movie announce")
+                                continue
+                        except Exception as ex:
+                            logging.warning(f"Movie cutoff check failed for {item_id}: {ex}")
+
+                        notification_message = (
+                            f"*{t('new_movie_title')}*\n\n"
+                            f"*{name_clean}* *({year})*\n\n"
+                            f"{overview}\n\n"
+                            f"*{t('new_runtime')}*\n{runtime_str}"
+                        )
+
+                        # Рейтинги (MDBList), если доступны
+                        try:
+                            ratings_text = safe_fetch_mdblist_ratings("movie", tmdb_id) if tmdb_id else ""
+                            if ratings_text:
+                                notification_message += f"\n\n*{t('new_ratings_movie')}*\n{ratings_text}"
+                        except Exception as ex:
+                            logging.warning(f"Movie poll: ratings fetch failed for {name_clean} ({year}): {ex}")
+
+                        # Трейлер — предпочтительно по TMDb
+                        try:
+                            trailer_url = safe_get_trailer_prefer_tmdb(
+                                f"{name_clean} Trailer {year}",
+                                context="poll",
+                                subkind="movie",
+                                tmdb_id=tmdb_id
+                            )
+                            if trailer_url:
+                                notification_message += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
+                        except Exception as ex:
+                            logging.warning(f"Movie poll: trailer fetch failed for {name_clean} ({year}): {ex}")
+
+                        # Первичный блок качества (baseline), плюс дорожки — как в вебхуке
+                        # Качество: как в maybe_notify_movie_quality_change — через store_quality_snapshot_movie
+                        try:
+                            res_q = store_quality_snapshot_movie(
+                                item_id=item_id,
+                                name=name_clean,
+                                year=year,
+                                tmdb_id=tmdb_id,
+                                imdb_id=imdb_id
+                            )
+                            new_q = (res_q.get("new_quality") or {})
+                            old_q = res_q.get("old_quality")
+
+                            if old_q:
+                                # Если ранее в БД есть слепок — показать «Изменения качества»,
+                                # а если изменений нет — показать первичный блок
+                                delta = build_quality_changes_block(old_q, new_q)
+                                if delta:
+                                    notification_message += delta
+                                else:
+                                    init_block = build_initial_quality_changes_block(new_q)
+                                    if init_block:
+                                        notification_message += init_block
+                            else:
+                                # Иначе — «первичный» компактный блок качества
+                                init_block = build_initial_quality_changes_block(new_q)
+                                if init_block:
+                                    notification_message += init_block
+
+                            if INCLUDE_AUDIO_TRACKS:
+                                tracks_block = build_audio_tracks_block(new_q)
+                                if tracks_block:
+                                    notification_message += tracks_block
+
+                        except Exception as ex:
+                            logging.warning(
+                                f"Movie poll: failed to build quality block for {name_clean} ({year}): {ex}")
+
+                        send_notification(item_id, notification_message)
+                        mark_item_as_notified("Movie", name, year)
+                        logging.info(f"(Movie poll) NEW movie announced: {name_clean} ({year})")
+                        continue
+                # --- /NEW
+
             except Exception as ex:
                 logging.warning(f"Movie poll: item {it.get('Id')} failed: {ex}")
 
