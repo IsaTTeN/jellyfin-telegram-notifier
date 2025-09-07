@@ -138,6 +138,16 @@ EP_QUALITY_POLL_INTERVAL_SEC = int(os.getenv("EP_QUALITY_POLL_INTERVAL_SEC", "90
 EP_QUALITY_POLL_PAGE_SIZE = int(os.getenv("EP_QUALITY_POLL_PAGE_SIZE", "500"))
 EP_QUALITY_POLL_MAX_TOTAL = int(os.getenv("EP_QUALITY_POLL_MAX_TOTAL", "0"))  # 0 = без ограничения
 # Для "свежих" эпизодов можно переиспользовать SERIES_POLL_GRACE_MIN
+# Опрос музыкальных альбомов (по новым/изменённым альбомам)
+ALBUM_POLL_ENABLED = os.getenv("ALBUM_POLL_ENABLED", "1").lower() in ("1","true","yes","on")
+ALBUM_POLL_INTERVAL_SEC = int(os.getenv("ALBUM_POLL_INTERVAL_SEC", "80"))  # период, сек
+ALBUM_POLL_PAGE_SIZE = int(os.getenv("ALBUM_POLL_PAGE_SIZE", "500"))
+ALBUM_POLL_MAX_TOTAL = int(os.getenv("ALBUM_POLL_MAX_TOTAL", "0"))  # 0 = без ограничения
+ALBUM_POLL_GRACE_MIN = int(os.getenv("ALBUM_POLL_GRACE_MIN", "0"))  # свежие альбомы отдаём вебхуку (у нас его нет) -> 0
+# Опциональный вывод списка треков в сообщении про новый альбом
+ALBUM_TRACKLIST_ENABLED = os.getenv("ALBUM_TRACKLIST_ENABLED", "1").lower() in ("1","true","yes","on")
+ALBUM_TRACKLIST_LIMIT = int(os.getenv("ALBUM_TRACKLIST_LIMIT", "5"))  # максимальное число строк
+ALBUM_TRACKLIST_SHOW_DURATION = os.getenv("ALBUM_TRACKLIST_SHOW_DURATION", "1").lower() in ("1","true","yes","on")
 
 
 # Глобальные переменные
@@ -310,6 +320,43 @@ def _init_quality_db():
                         updated_at
                         TEXT  -- ISO
                     )""")
+        cur.execute("""
+                    CREATE TABLE IF NOT EXISTS album_announced
+                    (
+                        logical_key
+                        TEXT
+                        PRIMARY
+                        KEY,
+                        announced_at
+                        TEXT,
+                        item_id
+                        TEXT,
+                        album_name
+                        TEXT,
+                        artist_name
+                        TEXT,
+                        year
+                        INTEGER
+                    )
+                    """)
+        # --- NEW: фильмы, уже «объявленные» (дедуп в БД) ---
+        cur.execute("""
+                    CREATE TABLE IF NOT EXISTS movie_announced
+                    (
+                        logical_key
+                        TEXT
+                        PRIMARY
+                        KEY,
+                        announced_at
+                        TEXT,
+                        item_id
+                        TEXT,
+                        movie_name
+                        TEXT,
+                        year
+                        INTEGER
+                    )
+                    """)
         # Миграция: добавим episode_count, если столбца нет
         cur.execute("PRAGMA table_info(season_quality)")
         cols = {r[1] for r in cur.fetchall()}
@@ -376,6 +423,9 @@ MESSAGES = {
         "quality_updated": "🔼Quality update🔼",
         "season_added_progress": "Added {added} of {total} episodes",
         "season_added_count_only": "Added {added} episodes",
+        "new_track_count": "Tracks",
+        "album_tracklist": "Tracklist",
+        "album_tracklist_more": "…and {n} more",
     },
     "ru": {
         "new_movie_title": "🍿Новый фильм добавлен🍿",
@@ -394,6 +444,9 @@ MESSAGES = {
         "quality_updated": "🔼Обновление качества🔼",
         "season_added_progress": "Добавлено {added} из {total} серий",
         "season_added_count_only": "Добавлено {added} серий",
+        "new_track_count": "Количество треков",
+        "album_tracklist": "Список треков",
+        "album_tracklist_more": "…и ещё {n}",
     }
 }
 #Выбираем рабочий язык: если заданный отсутствует в MESSAGES — ставим en
@@ -1700,6 +1753,66 @@ def get_item_details(item_id):
     response.raise_for_status()  # Check if request was successful
     return response.json()
 
+def jellyfin_count_tracks_in_album(album_id: str) -> int | None:
+    """Возвращает количество песен в музыкальном альбоме.
+    Сначала пытаемся взять ChildCount у самого альбома; если нет — считаем дочерние Audio-элементы.
+    """
+    try:
+        # 1) Попробуем получить сам альбом с ChildCount
+        params = {'api_key': JELLYFIN_API_KEY, 'Ids': album_id, 'Fields': 'ChildCount'}
+        url = f"{JELLYFIN_BASE_URL}/emby/Items"
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        items = (r.json() or {}).get('Items') or []
+        if items:
+            cc = items[0].get('ChildCount')
+            if isinstance(cc, int) and cc >= 0:
+                return cc
+
+        # 2) Фолбэк: считаем дочерние элементы-аудиотреки
+        params = {
+            'api_key': JELLYFIN_API_KEY,
+            'ParentId': album_id,
+            'IncludeItemTypes': 'Audio',
+            'Recursive': 'false',
+            'IsMissing': 'false',
+            'LocationTypes': 'FileSystem',
+            'Fields': 'LocationType,Path',
+        }
+        r = requests.get(url, params=params, timeout=12)
+        r.raise_for_status()
+        return len((r.json() or {}).get('Items') or [])
+    except Exception as ex:
+        logging.warning(f"Album track count failed for {album_id}: {ex}")
+        return None
+
+def jellyfin_list_tracks_in_album(album_id: str, *, limit: int | None = None) -> list[dict]:
+    """
+    Возвращает список треков (минимальные поля) для альбома.
+    Поля: Name, IndexNumber, RunTimeTicks
+    """
+    try:
+        params = {
+            'api_key': JELLYFIN_API_KEY,
+            'ParentId': album_id,
+            'IncludeItemTypes': 'Audio',
+            'Recursive': 'false',
+            'IsMissing': 'false',
+            'LocationTypes': 'FileSystem',
+            'SortBy': 'IndexNumber,Name',
+            'SortOrder': 'Ascending',
+            'Fields': 'IndexNumber,RunTimeTicks'
+        }
+        if limit and limit > 0:
+            params['Limit'] = str(limit)
+        url = f"{JELLYFIN_BASE_URL}/emby/Items"
+        r = requests.get(url, params=params, timeout=12)
+        r.raise_for_status()
+        return (r.json() or {}).get('Items') or []
+    except Exception as ex:
+        logging.warning(f"Album track list failed for {album_id}: {ex}")
+        return []
+
 
 def is_within_last_x_days(date_str, x):
     days_ago = datetime.now() - timedelta(days=x)
@@ -2330,17 +2443,25 @@ def poll_recent_movies_once():
                         logging.info(
                             f"(Movie poll) Suppressed 'new movie' due to recent quality update (logical_key={logical_key})")
                     else:
-                        # --- Cutoff: skip "new movie" announce for films added BEFORE DB creation; mark as baseline-notified
+                        # --- Pre-DB cutoff: baseline записываем в БД (movie_announced)
                         try:
                             db_created_iso = _db_get_created_at_iso()
                             db_created_dt = _parse_iso_dt(db_created_iso)
                             created_iso = it.get("DateCreated")
                             created_dt = _parse_iso_dt(created_iso)
+
+                            # Если уже ставили baseline в БД — молча пропускаем
+                            if _movie_announced_get(logical_key):
+                                continue
+
                             if db_created_dt and created_dt and (created_dt < db_created_dt):
-                                # baseline: считаем уже «объявленным», чтобы дальше слать только апгрейды качества
-                                mark_item_as_notified("Movie", name, year)
-                                logging.info(
-                                    f"(Movie poll) Pre-DB cutoff baseline: {name_clean} ({year}) — suppressed new-movie announce")
+                                _movie_announced_mark(
+                                    logical_key,
+                                    item_id=item_id,
+                                    name=name_clean,
+                                    year=year
+                                )
+                                logging.debug(f"(Movie poll) Pre-DB cutoff baseline set: {name_clean} ({year})")
                                 continue
                         except Exception as ex:
                             logging.warning(f"Movie cutoff check failed for {item_id}: {ex}")
@@ -2412,7 +2533,7 @@ def poll_recent_movies_once():
                                 f"Movie poll: failed to build quality block for {name_clean} ({year}): {ex}")
 
                         send_notification(item_id, notification_message)
-                        mark_item_as_notified("Movie", name, year)
+                        _movie_announced_mark(logical_key, item_id=item_id, name=name_clean, year=year)
                         logging.info(f"(Movie poll) NEW movie announced: {name_clean} ({year})")
                         continue
                 # --- /NEW
@@ -3398,6 +3519,51 @@ def _sp_should_notify(season_id: str, present_now: int) -> bool:
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
 
+def _movie_announced_get(logical_key: str) -> dict | None:
+    try:
+        conn = sqlite3.connect(QUALITY_DB_FILE)
+        cur = conn.cursor()
+        cur.execute("""SELECT logical_key, announced_at, item_id, movie_name, year
+                       FROM movie_announced WHERE logical_key=?""", (logical_key,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "logical_key": row[0],
+            "announced_at": row[1],
+            "item_id": row[2],
+            "movie_name": row[3],
+            "year": row[4],
+        }
+    except Exception as ex:
+        logging.debug(f"_movie_announced_get failed: {ex}")
+        return None
+    finally:
+        try: conn.close()
+        except: pass
+
+
+def _movie_announced_mark(logical_key: str, *, item_id: str | None, name: str | None, year: int | None):
+    try:
+        conn = sqlite3.connect(QUALITY_DB_FILE)
+        cur = conn.cursor()
+        nowz = datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
+        cur.execute("""
+            INSERT INTO movie_announced (logical_key, announced_at, item_id, movie_name, year)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(logical_key) DO UPDATE SET
+              announced_at = excluded.announced_at,
+              item_id      = COALESCE(excluded.item_id, movie_announced.item_id),
+              movie_name   = COALESCE(excluded.movie_name, movie_announced.movie_name),
+              year         = COALESCE(excluded.year, movie_announced.year)
+        """, (logical_key, nowz, item_id, name, year))
+        conn.commit()
+    except Exception as ex:
+        logging.debug(f"_movie_announced_mark failed: {ex}")
+    finally:
+        try: conn.close()
+        except: pass
+
 def _extcache_key(kind: str, subkind: str | None, identity: str) -> str:
     # Единый формат ключа
     s = subkind or "-"
@@ -4114,6 +4280,243 @@ if EP_QUALITY_POLL_ENABLED:
     threading.Thread(target=_ep_quality_poll_loop, name="ep-quality-poll", daemon=True).start()
     logging.info(f"Episode/Season quality polling enabled every {EP_QUALITY_POLL_INTERVAL_SEC}s "
                  f"(page={EP_QUALITY_POLL_PAGE_SIZE}, max_total={EP_QUALITY_POLL_MAX_TOTAL}, grace={SERIES_POLL_GRACE_MIN}m)")
+
+#Отправка информации о новых альбомах
+def _album_announced_get(logical_key: str) -> dict | None:
+    try:
+        conn = sqlite3.connect(QUALITY_DB_FILE)
+        cur = conn.cursor()
+        cur.execute("""SELECT logical_key, announced_at, item_id, album_name, artist_name, year
+                       FROM album_announced WHERE logical_key=?""", (logical_key,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {"logical_key": row[0], "announced_at": row[1], "item_id": row[2],
+                "album_name": row[3], "artist_name": row[4], "year": row[5]}
+    except Exception as ex:
+        logging.debug(f"_album_announced_get failed: {ex}")
+        return None
+    finally:
+        try: conn.close()
+        except: pass
+
+def _album_announced_mark(logical_key: str, *, item_id: str | None, album: str | None,
+                          artist: str | None, year: int | None):
+    try:
+        conn = sqlite3.connect(QUALITY_DB_FILE)
+        cur = conn.cursor()
+        nowz = datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
+        cur.execute("""
+            INSERT INTO album_announced (logical_key, announced_at, item_id, album_name, artist_name, year)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(logical_key) DO UPDATE SET
+              announced_at = excluded.announced_at,
+              item_id      = COALESCE(excluded.item_id, album_announced.item_id),
+              album_name   = COALESCE(excluded.album_name, album_announced.album_name),
+              artist_name  = COALESCE(excluded.artist_name, album_announced.artist_name),
+              year         = COALESCE(excluded.year, album_announced.year)
+        """, (logical_key, nowz, item_id, album, artist, year))
+        conn.commit()
+    except Exception as ex:
+        logging.debug(f"_album_announced_mark failed: {ex}")
+    finally:
+        try: conn.close()
+        except: pass
+
+def _album_logical_key(*, musicbrainz_id: str | None, artist: str, album: str, year: int | None) -> str:
+    if musicbrainz_id:
+        return f"album:mb:{musicbrainz_id}"
+    a = re.sub(r"\s+", " ", (artist or "").strip().lower())
+    n = re.sub(r"\s+", " ", (album  or "").strip().lower())
+    return f"album:nameyear:{a}–{n}:{year or ''}"
+
+def poll_recent_albums_once():
+    """
+    Пагинированно тянем MusicAlbum и отправляем уведомления о НОВЫХ альбомах.
+    Свежие (очень недавно созданные) можно пропускать через GRACE (у нас по-умолчанию 0).
+    """
+    page_size = ALBUM_POLL_PAGE_SIZE
+    max_total = ALBUM_POLL_MAX_TOTAL  # 0 = без ограничения
+
+    start = 0
+    fetched = 0
+    now_utc = datetime.now(timezone.utc)
+
+    while True:
+        current_limit = page_size if not max_total else max(0, max_total - fetched)
+        if current_limit == 0:
+            break
+
+        try:
+            params = {
+                'api_key': JELLYFIN_API_KEY,
+                'IncludeItemTypes': 'MusicAlbum',
+                'Recursive': 'true',
+                'SortBy': 'DateModified,DateCreated',
+                'SortOrder': 'Descending',
+                'Limit': str(current_limit),
+                'StartIndex': str(start),
+                'Fields': 'ProviderIds,ProductionYear,Overview,DateCreated,RunTimeTicks,Artists,AlbumArtist',
+            }
+            url = f"{JELLYFIN_BASE_URL}/emby/Items"
+            r = requests.get(url, params=params, timeout=20)
+            r.raise_for_status()
+            items = (r.json() or {}).get('Items') or []
+        except Exception as ex:
+            logging.warning(f"Album poll: failed page start={start}: {ex}")
+            break
+
+        if not items:
+            break
+
+        for it in items:
+            try:
+                item_id = it.get('Id')
+                album_name = (it.get('Name') or '').strip()
+                year = it.get('ProductionYear')
+                # artist: пробуем AlbumArtist, затем первый из Artists
+                artist = (it.get('AlbumArtist') or '').strip()
+                if not artist:
+                    artists = it.get('Artists') or []
+                    artist = (artists[0] if artists else '') or ''
+
+                name_clean = re.sub(r"\s+", " ", album_name).strip()
+                artist_clean = re.sub(r"\s+", " ", artist).strip()
+                key_name = f"{artist_clean} – {name_clean}".strip(" –")
+
+                prov = it.get('ProviderIds') or {}
+                mb_id = prov.get('MusicBrainzAlbum')
+                logical_key = _album_logical_key(musicbrainz_id=mb_id, artist=artist_clean, album=name_clean, year=year)
+
+                # 1) Уже объявлен? — выходим молча
+                if _album_announced_get(logical_key):
+                    continue
+
+                # GRACE: очень свежие пусть пропускаем, если включили
+                created_iso = it.get('DateCreated')
+                created_dt = _parse_iso_dt(created_iso)
+                if ALBUM_POLL_GRACE_MIN and created_dt:
+                    if (now_utc - created_dt).total_seconds() < ALBUM_POLL_GRACE_MIN * 60:
+                        continue
+
+                # --- Срез по дате создания БД (без UnboundLocalError) ---
+                db_created_iso = None
+                db_created_dt = None
+
+                try:
+                    db_created_iso = _db_get_created_at_iso()
+                    db_created_dt = _parse_iso_dt(db_created_iso)
+                except Exception as ex:
+                    logging.warning(f"Album cutoff: DB date parse failed for {item_id}: {ex}")
+
+                try:
+                    created_iso = it.get('DateCreated')  # может быть None/пусто
+                    created_dt = _parse_iso_dt(created_iso) if created_iso else None
+                except Exception as ex:
+                    logging.warning(f"Album cutoff: item date parse failed for {item_id}: {ex}")
+
+                # ВАЖНО: проверяем И ТОЛЬКО ЗДЕСЬ, уже вне try/except
+                if db_created_dt and created_dt and (created_dt < db_created_dt):
+                    _album_announced_mark(
+                        logical_key,
+                        item_id=item_id,
+                        album=name_clean,
+                        artist=artist_clean,
+                        year=year
+                    )
+                    logging.debug(f"(Album poll) Pre-DB cutoff baseline set: {artist_clean} – {name_clean} ({year})")
+                    continue
+
+                # Сообщение
+                overview = it.get('Overview') or ''
+                runtime = _format_runtime_from_ticks(it.get('RunTimeTicks')) if 'RunTimeTicks' in it else None
+                prov = it.get('ProviderIds') or {}
+                mb_id = prov.get('MusicBrainzAlbum')
+                mb_link = f"https://musicbrainz.org/release/{mb_id}" if mb_id else ''
+
+                notification_message = (
+                    f"*{t('new_album_title')}*\n\n"
+                    f"*{artist_clean}*\n\n"
+                    f"*{name_clean} ({year})*\n\n"
+                    f"{(overview + '\n\n') if overview else ''}"
+                )
+                if runtime:
+                    notification_message += f"*{t('new_runtime')}*\n{runtime}\n\n"
+
+                # Количество треков
+                tracks = jellyfin_count_tracks_in_album(item_id)
+                if tracks is not None:
+                    notification_message += f"*{t('new_track_count')}*\n{tracks}\n\n"
+
+                # Опционально: список треков (точный расчёт «сколько не показали»)
+                if ALBUM_TRACKLIST_ENABLED:
+                    try:
+                        # ВАЖНО: берём ровно лимит — без +1
+                        raw_tracks = jellyfin_list_tracks_in_album(item_id, limit=ALBUM_TRACKLIST_LIMIT)
+                        if raw_tracks:
+                            lines = []
+                            for i, tr in enumerate(raw_tracks, 1):
+                                idx = tr.get("IndexNumber") or i
+                                title = tr.get("Name") or f"Track {i}"
+                                if ALBUM_TRACKLIST_SHOW_DURATION:
+                                    dur = _format_runtime_from_ticks(
+                                        tr.get("RunTimeTicks")) if "RunTimeTicks" in tr else None
+                                else:
+                                    dur = None
+                                line = f"{idx:02d}. {title}" + (f" — {dur}" if dur else "")
+                                lines.append(line)
+
+                            if lines:
+                                notification_message += f"*{t('album_tracklist')}*\n" + "\n".join(lines) + "\n"
+
+                            # tracks — это ОБЩЕЕ количество, уже получено выше через jellyfin_count_tracks_in_album(item_id)
+                            displayed = len(lines)
+                            if isinstance(tracks, int):
+                                remaining = max(0, tracks - displayed)
+                                if remaining > 0:
+                                    more_tpl = t('album_tracklist_more')  # содержит {n}
+                                    notification_message += more_tpl.replace("{n}", str(remaining)) + "\n"
+
+                            notification_message += "\n"
+                    except Exception as ex:
+                        logging.warning(f"Album tracklist render failed for {item_id}: {ex}")
+
+                if mb_link:
+                    notification_message += f"[MusicBrainz]({mb_link})\n"
+
+                send_notification(item_id, notification_message)
+                _album_announced_mark(
+                    logical_key,
+                    item_id=item_id,
+                    album=name_clean,
+                    artist=artist_clean,
+                    year=year
+                )
+                logging.info(f"(Album poll) NEW album: {artist_clean} – {name_clean} ({year})")
+            except Exception as ex:
+                logging.warning(f"Album poll: item {it.get('Id')} failed: {ex}")
+
+        n = len(items)
+        fetched += n
+        start += n
+        if max_total and fetched >= max_total:
+            break
+        if n < current_limit:
+            break
+
+def _album_poll_loop():
+    while True:
+        try:
+            wait_until_scan_idle("album poll")
+            poll_recent_albums_once()
+        except Exception as ex:
+            logging.warning(f"Album poll loop error: {ex}")
+        time.sleep(ALBUM_POLL_INTERVAL_SEC)
+
+if ALBUM_POLL_ENABLED:
+    threading.Thread(target=_album_poll_loop, name="album-poll", daemon=True).start()
+    logging.info(f"Album polling enabled every {ALBUM_POLL_INTERVAL_SEC}s "
+                 f"(page={ALBUM_POLL_PAGE_SIZE}, max_total={ALBUM_POLL_MAX_TOTAL}, grace={ALBUM_POLL_GRACE_MIN}m)")
 
 
 @app.route("/webhook", methods=["POST"])
