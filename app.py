@@ -734,25 +734,30 @@ def upload_image_to_imgbb(image_bytes):
     imgbb_upload_done.set()  # Сигнал, что загрузка завершена (успешно или нет)
     return uploaded_image_url
 
-def wait_for_imgbb_upload():
+def wait_for_imgbb_upload(timeout: float | None = 10.0):
     """
-    Блокирует выполнение до завершения загрузки изображения.
+    Ждать завершения загрузки на imgbb ограниченное время.
+    Возвращает URL или None по таймауту/ошибке.
     """
-    imgbb_upload_done.wait()
+    signaled = imgbb_upload_done.wait(timeout=timeout if timeout is not None else None)
+    if not signaled:
+        logging.warning("IMGBB wait timed out; continue without image.")
     return uploaded_image_url
 
 
 def get_jellyfin_image_and_upload_imgbb(photo_id):
-    """
-    Скачивает изображение из Jellyfin и загружает его на imgbb, возвращая публичную ссылку.
-    """
     jellyfin_image_url = f"{JELLYFIN_BASE_URL}/Items/{photo_id}/Images/Primary"
     try:
-        resp = requests.get(jellyfin_image_url)
+        resp = requests.get(jellyfin_image_url, timeout=10)
         resp.raise_for_status()
         return upload_image_to_imgbb(resp.content)
     except Exception as ex:
         logging.warning(f"Ошибка скачивания из Jellyfin: {ex}")
+        # ВАЖНО: разблокировать потенциальных ожидателей imgbb
+        try:
+            imgbb_upload_done.set()
+        except Exception:
+            pass
         return None
 
 def send_discord_message(photo_id, message, title="Jellyfin", uploaded_url=None):
@@ -1275,7 +1280,7 @@ def send_notification(photo_id, caption):
     base_photo_url = f"{JELLYFIN_BASE_URL}/Items/{photo_id}/Images/Primary"
     attach_param = None
     try:
-        image_response = requests.get(base_photo_url)
+        image_response = requests.get(base_photo_url, timeout=10)
         if image_response.ok:
             # Сохраняем изображение во временный файл
             with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
@@ -1620,24 +1625,23 @@ def send_matrix_image_then_text_from_jellyfin(photo_id: str, caption_markdown: s
     return img_ok and txt_ok
 
 def send_gotify_message(photo_id, message, title="Jellyfin", priority=5, uploaded_url=None):
-    img_url = wait_for_imgbb_upload()
-    if not img_url:
-        logging.warning("Изображение не загружено — пропускаем отправку в Gotify.")
-        return
     """
-    Отправка сообщения и картинки напрямую в Gotify.
+    Отправка в Gotify. Если картинка не готова — шлём текст без изображения.
     """
     if not GOTIFY_URL or not GOTIFY_TOKEN:
         logging.warning("GOTIFY_URL or GOTIFY_TOKEN not set, skipping Gotify notification.")
         return None
 
+    # Если URL ещё не известен — подождём чуть-чуть, но не блокируемся надолго.
     if uploaded_url is None:
-        uploaded_url = get_jellyfin_image_and_upload_imgbb(photo_id)
+        uploaded_url = wait_for_imgbb_upload(timeout=0.5)
+
     if uploaded_url:
         message = f"![Poster]({uploaded_url})\n\n{message}"
         big_image_url = uploaded_url
     else:
         big_image_url = None
+        logging.debug("IMGBB URL missing — sending Gotify text-only.")
 
     gotify_url = GOTIFY_URL.rstrip('/')
     url = f"{gotify_url}/message?token={GOTIFY_TOKEN}"
@@ -4548,7 +4552,7 @@ def poll_recent_albums_once():
                                 lines.append(line)
 
                             if lines:
-                                notification_message += f"*{t('album_tracklist')}*\n" + "\n".join(lines) + "\n"
+                                notification_message += f"*{t('album_tracklist')}*\n\n" + "\n".join(lines) + "\n"
 
                             # tracks — это ОБЩЕЕ количество, уже получено выше через jellyfin_count_tracks_in_album(item_id)
                             displayed = len(lines)
