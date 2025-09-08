@@ -83,6 +83,19 @@ SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "1") not in ("0", "", "false", "Fa
 SMTP_USE_SSL = os.environ.get("SMTP_USE_SSL", "0") in ("1", "true", "True")   # для SMTPS (465); если 1, то TLS не используем
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "")   # ID канала, например C0123456789
+# --- Home Assistant notifications ---
+HA_BASE_URL = os.getenv("HA_BASE_URL", "").rstrip("/")          # например: http://192.168.1.10:8123
+HA_TOKEN    = os.getenv("HA_TOKEN", "")                         # Long-Lived Access Token из профиля HA
+HA_VERIFY_SSL = os.getenv("HA_VERIFY_SSL", "1").lower() in ("1","true","yes","on")
+
+# Куда слать по умолчанию:
+# для мобильного приложения указывайте notify/<имя_сервиса>, напр. "notify/mobile_app_m2007j20cg"
+# для встроенной «постоянной» нотификации укажите "persistent_notification/create"
+HA_DEFAULT_SERVICE = os.getenv("HA_DEFAULT_SERVICE", "persistent_notification/create")
+# Показывать ссылку на постер в persistent_notification
+HA_PN_IMAGE_LINK = os.getenv("HA_PN_IMAGE_LINK", "1").lower() in ("1","true","yes","on")
+HA_PN_IMAGE_LABEL = os.getenv("HA_PN_IMAGE_LABEL", "Poster")  # Заголовок перед ссылкой
+
 #выключение контроля добавленного контента
 DISABLE_DEDUP = os.getenv("NOTIFIER_DISABLE_DEDUP", "0").lower() in ("1", "true", "yes")
 #настройки для фильмов
@@ -1231,6 +1244,24 @@ def send_notification(photo_id, caption):
     except Exception as sl_ex:
         logging.warning(f"Slack send failed: {sl_ex}")
     # ======================================================
+#Отправка в home assistant
+    try:
+        if HA_BASE_URL and HA_TOKEN:
+            _title = "Jellyfin"
+            # Можно красиво вытащить заголовок из первой жирной строки, если хотите:
+            # m = re.match(r"\*\s*(.+?)\s*\*", caption); _title = (m.group(1)[:120] if m else _title)
+
+            # uploaded_url — это ваш URL постера (если он есть)
+            send_homeassistant_message(
+                message=caption,
+                title=_title,
+                service_path=None,  # берётся из HA_DEFAULT_SERVICE
+                notification_id="jellyfin",  # опционально для persistent_notification
+                image_url=uploaded_url  # <-- вот тут передаём картинку
+            )
+    except Exception as ex:
+        logging.warning(f"Home Assistant notify wrapper failed: {ex}")
+
     # ======= MATRIX (REST): СНАЧАЛА изображение из Jellyfin, затем текст =======
     try:
         if MATRIX_URL and MATRIX_ACCESS_TOKEN and MATRIX_ROOM_ID:
@@ -1684,6 +1715,64 @@ def send_gotify_message(photo_id, message, title="Jellyfin", priority=5, uploade
     except Exception as ex:
         logging.warning(f"Error sending to Gotify: {ex}")
         return None
+
+
+def send_homeassistant_message(message: str,
+                               title: str | None = None,
+                               service_path: str | None = None,
+                               notification_id: str | None = None,
+                               image_url: str | None = None) -> bool:
+    """
+    Универсальная отправка сервиса Home Assistant.
+    По умолчанию используется persistent_notification/create.
+    - Для persistent_notification: поддерживаются message, title, notification_id.
+      Картинки не поддерживаются — можем (опционально) добавить ссылку в текст.
+    - Для прочих сервисов, если они умеют поле 'image', передадим его в 'data.image'.
+    """
+    try:
+        if not HA_BASE_URL or not HA_TOKEN:
+            return False
+
+        service_path = (service_path or HA_DEFAULT_SERVICE).strip().strip("/")
+        domain, _, service = service_path.partition("/")
+        if not domain or not service:
+            logging.warning(f"Home Assistant: invalid service_path '{service_path}'")
+            return False
+
+        url = f"{HA_BASE_URL}/api/services/{domain}/{service}"
+        headers = {
+            "Authorization": f"Bearer {HA_TOKEN}",
+            "Content-Type": "application/json",
+        }
+
+        # Базовый payload
+        final_message = message
+
+        # Если это persistent_notification — добавим ссылку на картинку (если включено)
+        if domain == "persistent_notification" and image_url and HA_PN_IMAGE_LINK:
+            final_message = f"{message}\n\n{HA_PN_IMAGE_LABEL}: {image_url}"
+
+        payload = {"message": final_message}
+        if title:
+            payload["title"] = title
+        if domain == "persistent_notification" and notification_id:
+            payload["notification_id"] = notification_id
+
+        # Для других доменов попробуем вложить картинку стандартным образом
+        if domain != "persistent_notification" and image_url:
+            payload["data"] = {"image": image_url}
+
+        resp = requests.post(url, headers=headers, json=payload, timeout=8, verify=HA_VERIFY_SSL)
+        if resp.status_code != 200:
+            logging.warning(f"Home Assistant notify failed {resp.status_code}: {resp.text[:300]}")
+            return False
+
+        logging.info(f"Home Assistant notification sent via {domain}/{service}")
+        return True
+
+    except Exception as ex:
+        logging.warning(f"Home Assistant notify error: {ex}")
+        return False
 
 def send_signal_message_with_image(photo_id, message, SIGNAL_NUMBER, SIGNAL_RECIPIENTS, api_url=SIGNAL_URL):
     """
