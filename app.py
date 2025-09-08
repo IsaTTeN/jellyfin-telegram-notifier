@@ -87,6 +87,17 @@ SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "")   # ID канала, �
 HA_BASE_URL = os.getenv("HA_BASE_URL", "").rstrip("/")          # например: http://192.168.1.10:8123
 HA_TOKEN    = os.getenv("HA_TOKEN", "")                         # Long-Lived Access Token из профиля HA
 HA_VERIFY_SSL = os.getenv("HA_VERIFY_SSL", "1").lower() in ("1","true","yes","on")
+# --- Pushover ---
+PUSHOVER_USER_KEY = os.getenv("PUSHOVER_USER_KEY", "")  # ваш user/group key
+PUSHOVER_TOKEN    = os.getenv("PUSHOVER_TOKEN", "")     # ваш app token
+PUSHOVER_SOUND    = os.getenv("PUSHOVER_SOUND", "")     # опц.: имя звука (см. API sounds)
+PUSHOVER_DEVICE   = os.getenv("PUSHOVER_DEVICE", "")    # опц.: конкретное устройство
+PUSHOVER_PRIORITY = int(os.getenv("PUSHOVER_PRIORITY", "0"))  # -2..2
+PUSHOVER_HTML     = os.getenv("PUSHOVER_HTML", "0").lower() in ("1","true","yes","on")
+
+# если будете использовать экстренный приоритет (2)
+PUSHOVER_EMERGENCY_RETRY  = int(os.getenv("PUSHOVER_EMERGENCY_RETRY",  "60"))   # >= 30 сек
+PUSHOVER_EMERGENCY_EXPIRE = int(os.getenv("PUSHOVER_EMERGENCY_EXPIRE", "600"))  # сек
 
 # Куда слать по умолчанию:
 # для мобильного приложения указывайте notify/<имя_сервиса>, напр. "notify/mobile_app_m2007j20cg"
@@ -1197,7 +1208,7 @@ def send_notification(photo_id, caption):
     3. Остальные сервисы — через Apprise.
     """
     # Текст без Markdown (подходит для plain-транспорта, в т.ч. WhatsApp)
-#    caption_plain = clean_markdown_for_apprise(caption)
+    caption_plain = clean_markdown_for_apprise(caption)
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         tg_response = send_telegram_photo(photo_id, caption)
         if tg_response and tg_response.ok:
@@ -1261,7 +1272,24 @@ def send_notification(photo_id, caption):
             )
     except Exception as ex:
         logging.warning(f"Home Assistant notify wrapper failed: {ex}")
-
+#Отправка в pushover
+    try:
+        if PUSHOVER_USER_KEY and PUSHOVER_TOKEN:
+            _title = "Jellyfin"
+            # опционально: вытащим заголовок из первой жирной строки сообщения
+            img_bytes = _safe_fetch_jellyfin_image_bytes(photo_id)  # <— напрямую из Jellyfin
+            # uploaded_url — ваш уже известный URL постера (если есть)
+            send_pushover_message(
+                message=caption_plain,
+                title=_title,
+                image_bytes=img_bytes,  # <— передаём байты, никаких i.ibb.co
+                sound=(PUSHOVER_SOUND or None),
+                priority=PUSHOVER_PRIORITY,
+                device=(PUSHOVER_DEVICE or None),
+                html=False
+            )
+    except Exception as ex:
+        logging.warning(f"Pushover wrapper failed: {ex}")
     # ======= MATRIX (REST): СНАЧАЛА изображение из Jellyfin, затем текст =======
     try:
         if MATRIX_URL and MATRIX_ACCESS_TOKEN and MATRIX_ROOM_ID:
@@ -1715,6 +1743,88 @@ def send_gotify_message(photo_id, message, title="Jellyfin", priority=5, uploade
     except Exception as ex:
         logging.warning(f"Error sending to Gotify: {ex}")
         return None
+
+def send_pushover_message(message: str,
+                          title: str | None = None,
+                          image_url: str | None = None,
+                          image_bytes: bytes | None = None,
+                          *,
+                          sound: str | None = None,
+                          priority: int | None = None,
+                          device: str | None = None,
+                          html: bool = False) -> bool:
+    """
+    Отправка уведомления в Pushover.
+    Если переданы image_bytes — используем их напрямую (без сетевых скачиваний).
+    Иначе (как запасной вариант) попробуем image_url с коротким таймаутом.
+    """
+    try:
+        if not (PUSHOVER_USER_KEY and PUSHOVER_TOKEN):
+            return False
+
+        endpoint = "https://api.pushover.net/1/messages.json"
+        data = {
+            "token":   PUSHOVER_TOKEN,
+            "user":    PUSHOVER_USER_KEY,
+            "message": (message or "")[:1024],
+        }
+        if title:
+            data["title"] = title[:250]
+        if device:
+            data["device"] = device
+        if sound:
+            data["sound"] = sound
+        if priority is not None:
+            data["priority"] = str(priority)
+            if int(priority) == 2:
+                data["retry"]  = str(max(30, int(PUSHOVER_EMERGENCY_RETRY)))
+                data["expire"] = str(max(1,  int(PUSHOVER_EMERGENCY_EXPIRE)))
+        if html:
+            data["html"] = "1"
+
+        files = None
+        if image_bytes:
+            files = {"attachment": ("poster.jpg", image_bytes, "image/jpeg")}
+        elif image_url:
+            try:
+                ir = requests.get(image_url, timeout=6)
+                ir.raise_for_status()
+                content = ir.content
+                if len(content) <= 5242880:
+                    mime = ir.headers.get("Content-Type") or "image/jpeg"
+                    files = {"attachment": ("poster.jpg", content, mime)}
+                else:
+                    logging.warning("Pushover: image > 5MB, sending without attachment.")
+            except Exception as ex:
+                logging.warning(f"Pushover: image fetch failed: {ex}")
+
+        resp = requests.post(endpoint, data=data, files=files, timeout=10)
+        if resp.status_code != 200:
+            logging.warning(f"Pushover failed {resp.status_code}: {resp.text[:300]}")
+            return False
+
+        logging.info("Pushover notification sent")
+        return True
+
+    except Exception as ex:
+        logging.warning(f"Pushover notify error: {ex}")
+        return False
+
+def _safe_fetch_jellyfin_image_bytes(item_id: str) -> bytes | None:
+    """
+    Скачивает постер напрямую из Jellyfin, возвращает bytes либо None.
+    """
+    try:
+        url = f"{JELLYFIN_BASE_URL}/Items/{item_id}/Images/Primary"
+        # если требуется ключ в query, раскомментируй следующую строку:
+        # url = f"{url}?api_key={JELLYFIN_API_KEY}"
+        r = requests.get(url, timeout=6)
+        r.raise_for_status()
+        return r.content
+    except Exception as ex:
+        logging.debug(f"Pushover: Jellyfin image fetch failed for {item_id}: {ex}")
+        return None
+
 
 
 def send_homeassistant_message(message: str,
