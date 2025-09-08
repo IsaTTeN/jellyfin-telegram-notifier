@@ -407,6 +407,22 @@ def _init_quality_db():
                         INTEGER
                     )
                     """)
+        cur.execute("""
+                    CREATE TABLE IF NOT EXISTS app_meta
+                    (
+                        key
+                        TEXT
+                        PRIMARY
+                        KEY,
+                        value
+                        TEXT
+                    )
+                    """)
+        # при первом создании БД зафиксируем флаг «не отправлено»
+        cur.execute("""
+                    INSERT INTO app_meta(key, value)
+                    VALUES ('congrats_sent', '0') ON CONFLICT(key) DO NOTHING
+                    """)
         # Миграция: добавим episode_count, если столбца нет
         cur.execute("PRAGMA table_info(season_quality)")
         cols = {r[1] for r in cur.fetchall()}
@@ -484,6 +500,7 @@ MESSAGES = {
         "new_musicvideo_header": "🎶New music video added🎶",
         "new_musicvideo_artist": "Artist",
         "new_musicvideo_album": "Album",
+        "onboarding_congrats": "🎉 Congratulations! The app is ready to use.",
     },
     "ru": {
         "new_movie_title": "🍿Новый фильм добавлен🍿",
@@ -513,6 +530,7 @@ MESSAGES = {
         "new_musicvideo_header": "🎶Новый клип добавлен🎶",
         "new_musicvideo_artist": "Исполнитель",
         "new_musicvideo_album": "Альбом",
+        "onboarding_congrats": "🎉 Поздравляю! Программа готова к работе.",
     }
 }
 #Выбираем рабочий язык: если заданный отсутствует в MESSAGES — ставим en
@@ -2636,6 +2654,10 @@ def poll_recent_movies_once():
         # мягкое дыхание между страницами (не обязательно)
         time.sleep(0.1)
 
+    # ... в самом конце функции:
+    _meta_set('touched_movies','1')
+    _maybe_send_onboarding_congrats()
+
 def _detect_image_profiles_from_fields(s: dict) -> list[str]:
     """
     Детект DV / HDR10+ / HDR10 / HLG / HDR / SDR по полям видео-потока.
@@ -3493,6 +3515,10 @@ def poll_recent_episodes_once():
         logging.debug(f"Series poll: page fetched {n} episodes (total {fetched})")
         if n < current_limit:
             break  # последняя страница
+
+    # <<< ДОБАВИТЬ ВОТ ЗДЕСЬ (указать тот же отступ, что и у while) >>>
+    _meta_set('touched_series', '1')
+    _maybe_send_onboarding_congrats()
 
 def _series_poll_loop():
     while True:
@@ -4677,6 +4703,9 @@ def poll_recent_albums_once():
         if n < current_limit:
             break
 
+    _meta_set('touched_albums', '1')
+    _maybe_send_onboarding_congrats()
+
 def _album_poll_loop():
     while True:
         try:
@@ -4902,6 +4931,10 @@ def poll_recent_books_once():
             break
         if n < current_limit:
             break
+
+    _meta_set('touched_books', '1')
+    _maybe_send_onboarding_congrats()
+
 
     # ---- СБРОС ГРУПП: одно сообщение на книгу/аудиокнигу ----
     for lk, g in groups.items():
@@ -5199,143 +5232,8 @@ def poll_recent_musicvideos_once():
         if n < current_limit:
             break
 
-def poll_recent_musicvideos_once():
-    """
-    Ищем новые клипы (MusicVideo) в Jellyfin и шлём уведомления.
-    Дедуп — в таблице musicvideo_announced. Pre-DB cutoff — baseline в БД.
-    """
-    page_size = MVID_POLL_PAGE_SIZE
-    max_total = MVID_POLL_MAX_TOTAL  # 0 = без ограничения
-
-    start = 0
-    fetched = 0
-    now_utc = datetime.now(timezone.utc)
-
-    while True:
-        current_limit = page_size if not max_total else max(0, max_total - fetched)
-        if current_limit == 0:
-            break
-
-        try:
-            params = {
-                "api_key": JELLYFIN_API_KEY,
-                "IncludeItemTypes": "MusicVideo",
-                "Recursive": "true",
-                "SortBy": "DateModified,DateCreated",
-                "SortOrder": "Descending",
-                "Limit": str(current_limit),
-                "StartIndex": str(start),
-                # Полезные поля для сообщения/логики:
-                "Fields": "Artists,Album,ProviderIds,ProductionYear,Overview,DateCreated,RunTimeTicks"
-            }
-            url = f"{JELLYFIN_BASE_URL}/emby/Items"
-            r = requests.get(url, params=params, timeout=20)
-            r.raise_for_status()
-            items = (r.json() or {}).get("Items") or []
-        except Exception as ex:
-            logging.warning(f"MusicVideo poll: failed page start={start}: {ex}")
-            break
-
-        if not items:
-            break
-
-        for it in items:
-            try:
-                item_id = it.get("Id")
-                title = (it.get("Name") or "").strip()
-                year = it.get("ProductionYear")
-                overview = (it.get("Overview") or "").strip()
-
-                # Исполнитель
-                artists = it.get("Artists") or []
-                artist = (artists[0] if artists else "") or ""
-                artist_clean = re.sub(r"\s+", " ", artist).strip()
-
-                title_clean = re.sub(r"\s+", " ", title).strip()
-
-                # Логический ключ
-                logical_key = _musicvideo_logical_key(
-                    artist=artist_clean,
-                    title=title_clean,
-                    year=year
-                )
-
-                # Уже объявляли? — молча пропускаем
-                if _musicvideo_announced_get(logical_key):
-                    continue
-
-                # Даты безопасно
-                created_iso = it.get("DateCreated")
-                created_dt = None
-                db_created_dt = None
-                try:
-                    created_dt = _parse_iso_dt(created_iso) if created_iso else None
-                except Exception as ex:
-                    logging.debug(f"MVID cutoff: item date parse failed for {item_id}: {ex}")
-                try:
-                    db_created_iso = _db_get_created_at_iso()
-                    db_created_dt = _parse_iso_dt(db_created_iso)
-                except Exception as ex:
-                    logging.debug(f"MVID cutoff: DB date parse failed: {ex}")
-
-                # Pre-DB cutoff → baseline в БД (не спамим)
-                if db_created_dt and created_dt and (created_dt < db_created_dt):
-                    _musicvideo_announced_mark(
-                        logical_key,
-                        item_id=item_id,
-                        title=title_clean,
-                        artist=artist_clean,
-                        year=year
-                    )
-                    logging.debug(f"(MusicVideo poll) Pre-DB baseline set: {artist_clean} – {title_clean} ({year})")
-                    continue
-
-                # GRACE (если включён)
-                if MVID_POLL_GRACE_MIN and created_dt:
-                    if (now_utc - created_dt).total_seconds() < MVID_POLL_GRACE_MIN * 60:
-                        continue
-
-                # Альбом клипа (если Jellyfin отдал)
-                album = (it.get("Album") or "").strip()
-
-                # Длительность
-                runtime = _format_runtime_from_ticks(it.get("RunTimeTicks")) if "RunTimeTicks" in it else None
-
-                # Сообщение
-                title_line = _format_title_with_year(title_clean, year)
-                msg = (
-                    f"*{t('new_musicvideo_header')}*\n\n"
-                )
-                if artist_clean:
-                    msg += f"*{t('new_musicvideo_artist')}*\n{artist_clean}\n\n"
-                msg += f"*{title_line}*\n\n"
-                if album:
-                    msg += f"*{t('new_musicvideo_album')}*\n{album}\n\n"
-                if runtime:
-                    msg += f"*{t('new_runtime')}*\n{runtime}\n\n"
-                if overview:
-                    msg += f"{overview}\n"
-
-                send_notification(item_id, msg)
-
-                _musicvideo_announced_mark(
-                    logical_key,
-                    item_id=item_id,
-                    title=title_clean,
-                    artist=artist_clean,
-                    year=year
-                )
-                logging.info(f"(MusicVideo poll) NEW clip: {artist_clean} – {title_clean} ({year})")
-            except Exception as ex:
-                logging.warning(f"MusicVideo poll: item {it.get('Id')} failed: {ex}")
-
-        n = len(items)
-        fetched += n
-        start += n
-        if max_total and fetched >= max_total:
-            break
-        if n < current_limit:
-            break
+    _meta_set('touched_mvids', '1')
+    _maybe_send_onboarding_congrats()
 
 def _musicvideo_poll_loop():
     while True:
@@ -5351,6 +5249,70 @@ if MVID_POLL_ENABLED:
     logging.info(f"MusicVideo polling enabled every {MVID_POLL_INTERVAL_SEC}s "
                  f"(page={MVID_POLL_PAGE_SIZE}, max_total={MVID_POLL_MAX_TOTAL}, grace={MVID_POLL_GRACE_MIN}m)")
 
+#Оповещение о готовноасти базы данных
+def _meta_get(key: str) -> str | None:
+    try:
+        conn = sqlite3.connect(QUALITY_DB_FILE, timeout=10)
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM app_meta WHERE key=?", (key,))
+        row = cur.fetchone()
+        return row[0] if row else None
+    except Exception as ex:
+        logging.debug(f"_meta_get({key}) failed: {ex}")
+        return None
+    finally:
+        try: conn.close()
+        except: pass
+
+def _meta_set(key: str, value: str):
+    try:
+        conn = sqlite3.connect(QUALITY_DB_FILE, timeout=10)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO app_meta(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """, (key, value))
+        conn.commit()
+    except Exception as ex:
+        logging.debug(f"_meta_set({key}) failed: {ex}")
+    finally:
+        try: conn.close()
+        except: pass
+
+def _maybe_send_onboarding_congrats():
+    try:
+        # уже слали?
+        if _meta_get('congrats_sent') == '1':
+            return
+
+        # какие опросчики включены — таких и ждём
+        needed = []
+        if 'MOVIE_POLL_ENABLED' in globals() and MOVIE_POLL_ENABLED:
+            needed.append('movies')
+        if 'SERIES_POLL_ENABLED' in globals() and SERIES_POLL_ENABLED:
+            needed.append('series')
+        if 'ALBUM_POLL_ENABLED' in globals() and ALBUM_POLL_ENABLED:
+            needed.append('albums')
+        if 'BOOK_POLL_ENABLED' in globals() and BOOK_POLL_ENABLED:
+            needed.append('books')
+        if 'MVID_POLL_ENABLED' in globals() and MVID_POLL_ENABLED:
+            needed.append('mvids')
+
+        # если ничего не включено — не шлём
+        if not needed:
+            return
+
+        # все ли «к себе сходили» хотя бы один раз?
+        for k in needed:
+            if _meta_get(f'touched_{k}') != '1':
+                return
+
+        # всё, готово — шлём и помечаем
+        send_notification("system", t("onboarding_congrats"))
+        _meta_set('congrats_sent', '1')
+        logging.info("Onboarding: congrats notification sent.")
+    except Exception as ex:
+        logging.warning(f"Onboarding congrats check failed: {ex}")
 
 
 
