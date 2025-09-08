@@ -454,6 +454,8 @@ MESSAGES = {
         "new_book_title": "📖New book Added📖",
         "new_authors": "Author(s)",
         "new_isbn": "ISBN",
+        "new_book_header": "📖New book Added📖",
+        "new_audiobook_header": "💿New audiobook added💿",
     },
     "ru": {
         "new_movie_title": "🍿Новый фильм добавлен🍿",
@@ -478,6 +480,8 @@ MESSAGES = {
         "new_book_title": "📖Новая книга добавлена📖",
         "new_authors": "Автор(ы)",
         "new_isbn": "ISBN",
+        "new_book_header": "📖Новая книга добавлена📖",
+        "new_audiobook_header": "💿Новая аудиокнига добавлена💿",
     }
 }
 #Выбираем рабочий язык: если заданный отсутствует в MESSAGES — ставим en
@@ -4631,18 +4635,27 @@ def _extract_isbn(it: dict) -> str | None:
 
 def poll_recent_books_once():
     """
-    Ищем новые Book/AudioBook в Jellyfin и шлём уведомления.
+    Ищем новые Book/AudioBook в Jellyfin и шлём ОДНО сообщение на книгу/аудиокнигу.
+    Для аудиокниг части группируются: «… Часть 1–3». Дедуп — в таблице book_announced.
+    Заголовок:
+      - обычная книга:   t('new_book_header')      => «Новая книга добавлена»
+      - аудиокнига:      t('new_audiobook_header') => «Новая аудиокнига добавлена»
     """
     page_size = BOOK_POLL_PAGE_SIZE
-    max_total = BOOK_POLL_MAX_TOTAL
+    max_total = BOOK_POLL_MAX_TOTAL  # 0 = без ограничения
+
     start = 0
     fetched = 0
     now_utc = datetime.now(timezone.utc)
+
+    # Копим группы на весь проход (объединим части, пришедшие на разных страницах)
+    groups: dict[str, dict] = {}  # logical_key -> агрегат
 
     while True:
         current_limit = page_size if not max_total else max(0, max_total - fetched)
         if current_limit == 0:
             break
+
         try:
             params = {
                 "api_key": JELLYFIN_API_KEY,
@@ -4653,7 +4666,7 @@ def poll_recent_books_once():
                 "Limit": str(current_limit),
                 "StartIndex": str(start),
                 # важно: People/ProviderIds/DateCreated/Overview
-                "Fields": "People,ProviderIds,ProductionYear,Overview,DateCreated"
+                "Fields": "People,ProviderIds,ProductionYear,Overview,DateCreated",
             }
             url = f"{JELLYFIN_BASE_URL}/emby/Items"
             r = requests.get(url, params=params, timeout=20)
@@ -4669,27 +4682,37 @@ def poll_recent_books_once():
         for it in items:
             try:
                 item_id = it.get("Id")
-                title = (it.get("Name") or "").strip()
+                raw_title = (it.get("Name") or "").strip()
                 year = it.get("ProductionYear")
+                overview = (it.get("Overview") or "").strip()
+
+                # Авторы / ISBN
                 authors_list = _extract_book_authors(it)
-                authors = ", ".join(authors_list) if authors_list else ""
+                authors = ", ".join(a for a in authors_list if a) if authors_list else ""
                 isbn = _extract_isbn(it)
 
-                title_clean = re.sub(r"\s+", " ", title).strip()
+                title_clean = re.sub(r"\s+", " ", raw_title).strip()
                 authors_clean = re.sub(r"\s+", " ", authors).strip()
 
+                media_type = (it.get("Type") or "").lower()
+                if media_type == "audiobook":
+                    base_title, part_num, part_label = _strip_book_part_suffix(title_clean)
+                else:
+                    base_title, part_num, part_label = title_clean, None, None
+
+                # Логический ключ (по ISBN, иначе title+authors+year; для аудиокниг — БЕЗ номера части)
                 logical_key = _book_logical_key(
                     isbn=isbn,
-                    title=title_clean,
+                    title=base_title,
                     authors=authors_clean,
-                    year=year
+                    year=year,
                 )
 
-                # 1) Уже объявляли? — молча пропустим
+                # Уже объявляли? — молча пропускаем
                 if _book_announced_get(logical_key):
                     continue
 
-                # 2) Парсинг дат (без UnboundLocalError)
+                # Парсим даты безопасно
                 created_iso = it.get("DateCreated")
                 created_dt = None
                 db_created_dt = None
@@ -4703,38 +4726,49 @@ def poll_recent_books_once():
                 except Exception as ex:
                     logging.debug(f"Book cutoff: DB date parse failed: {ex}")
 
-                # 3) Pre-DB cutoff → baseline в БД
+                # Pre-DB cutoff → baseline в БД
                 if db_created_dt and created_dt and (created_dt < db_created_dt):
-                    _book_announced_mark(logical_key, item_id=item_id, title=title_clean,
-                                         authors=authors_clean, year=year)
-                    logging.debug(f"(Book poll) Pre-DB baseline set: {authors_clean} – {title_clean} ({year})")
+                    _book_announced_mark(
+                        logical_key,
+                        item_id=item_id,
+                        title=base_title,
+                        authors=authors_clean,
+                        year=year,
+                    )
+                    logging.debug(f"(Book poll) Pre-DB baseline set: {authors_clean} – {base_title} ({year})")
                     continue
 
-                # 4) GRACE по времени создания (если нужен)
+                # GRACE (если включён)
                 if BOOK_POLL_GRACE_MIN and created_dt:
                     if (now_utc - created_dt).total_seconds() < BOOK_POLL_GRACE_MIN * 60:
                         continue
 
-                # 5) Формируем сообщение
-                overview = it.get("Overview") or ""
-                title_line = _format_title_with_year(title_clean, year)
-                notification_message = (
-                    f"*{t('new_book_title')}*\n\n"
-                    f"*{title_line}*\n"
+                # Копим в группу (одно сообщение на книгу/аудиокнигу)
+                g = groups.setdefault(
+                    logical_key,
+                    {
+                        "item_ids": [],
+                        "base_title": base_title,
+                        "authors": authors_clean,
+                        "year": year,
+                        "parts": [],
+                        "label": part_label,
+                        "overview": "",
+                        "isbn": isbn,
+                        "is_audiobook": (media_type == "audiobook"),
+                    },
                 )
-                if authors_clean:
-                    notification_message += f"\n*{t('new_authors')}*\n{authors_clean}\n"
-                if isbn:
-                    notification_message += f"\n*{t('new_isbn')}*\n{isbn}\n"
-                if overview:
-                    notification_message += f"\n{overview}\n"
+                g["item_ids"].append(item_id)
+                if overview and not g["overview"]:
+                    g["overview"] = overview
+                if isinstance(part_num, int):
+                    g["parts"].append(part_num)
+                # если у какого-то экземпляра нет ISBN, а у другого есть — сохраним имеющийся
+                if not g["isbn"] and isbn:
+                    g["isbn"] = isbn
+                # если в группе смешанные типы (не должно быть, но на всякий)
+                g["is_audiobook"] = g.get("is_audiobook") or (media_type == "audiobook")
 
-                send_notification(item_id, notification_message)
-
-                # 6) Помечаем в БД
-                _book_announced_mark(logical_key, item_id=item_id, title=title_clean,
-                                     authors=authors_clean, year=year)
-                logging.info(f"(Book poll) NEW book: {authors_clean} – {title_clean} ({year})")
             except Exception as ex:
                 logging.warning(f"Book poll: item {it.get('Id')} failed: {ex}")
 
@@ -4745,6 +4779,43 @@ def poll_recent_books_once():
             break
         if n < current_limit:
             break
+
+    # ---- СБРОС ГРУПП: одно сообщение на книгу/аудиокнигу ----
+    for lk, g in groups.items():
+        title_for_msg = g["base_title"]
+        if g["parts"]:
+            rng = _format_number_ranges(g["parts"])
+            if rng:
+                label = g["label"] or "Часть"
+                title_for_msg = f"{title_for_msg}. {label} {rng}"
+
+        title_line = _format_title_with_year(title_for_msg, g["year"])
+        header_key = "new_audiobook_header" if g.get("is_audiobook") else "new_book_header"
+
+        msg = (
+            f"*{t(header_key)}*\n\n"
+            f"*{title_line}*\n"
+        )
+        if g["authors"]:
+            msg += f"\n*{t('new_authors')}*\n{g['authors']}\n"
+        if g["isbn"]:
+            msg += f"\n*{t('new_isbn')}*\n{g['isbn']}\n"
+        if g["overview"]:
+            msg += f"\n{g['overview']}\n"
+
+        first_id = (g["item_ids"][0] if g["item_ids"] else None) or "books"
+        send_notification(first_id, msg)
+
+        _book_announced_mark(
+            lk,
+            item_id=first_id,
+            title=g["base_title"],
+            authors=g["authors"],
+            year=g["year"],
+        )
+        logging.info(f"(Book poll) NEW book group: {g['authors']} – {title_for_msg} ({g['year']})")
+
+
 
 def _book_poll_loop():
     while True:
@@ -4759,6 +4830,67 @@ if BOOK_POLL_ENABLED:
     threading.Thread(target=_book_poll_loop, name="book-poll", daemon=True).start()
     logging.info(f"Book polling enabled every {BOOK_POLL_INTERVAL_SEC}s "
                  f"(page={BOOK_POLL_PAGE_SIZE}, max_total={BOOK_POLL_MAX_TOTAL}, grace={BOOK_POLL_GRACE_MIN}m)")
+
+# --- ГРУППИРОВКА ЧАСТЕЙ АУДИОКНИГ ---
+_ROMAN_MAP = {"I":1,"V":5,"X":10,"L":50,"C":100,"D":500,"M":1000}
+
+def _roman_to_int(s: str) -> int:
+    s = s.upper()
+    total = 0
+    prev = 0
+    for ch in reversed(s):
+        val = _ROMAN_MAP.get(ch, 0)
+        if val < prev:
+            total -= val
+        else:
+            total += val
+            prev = val
+    return total
+
+# паттерн: ... "Часть 1", "Part II", "Том 3", "Книга 01", "Disc 2", "CD 3", "Серия 4" в конце строки
+_PART_SUFFIX_RX = re.compile(r"""(?ix)
+    ^\s*
+    (?P<base>.*?)
+    (?:[\s\.\-–—,:]*)?
+    (?:
+        (?P<label>част(?:ь|и)|том|книга|part|disc|cd|серия)
+        \s*
+        (?P<num>[IVXLCM]+|\d+)
+    )
+    \s*$
+""")
+
+def _strip_book_part_suffix(title: str) -> tuple[str, int|None, str|None]:
+    m = _PART_SUFFIX_RX.match(title or "")
+    if not m:
+        return (title or "").strip(), None, None
+    base = (m.group("base") or "").strip().rstrip(" .–—-,:")
+    raw_label = (m.group("label") or "").lower()
+    if "част" in raw_label: label = "Часть"
+    elif "том" in raw_label: label = "Том"
+    elif "книга" in raw_label: label = "Книга"
+    elif "сер" in raw_label: label = "Серия"
+    else: label = "Part"
+    num_s = (m.group("num") or "").strip().upper()
+    num = _roman_to_int(num_s) if re.fullmatch(r"[IVXLCM]+", num_s) else (int(num_s) if num_s.isdigit() else None)
+    return base, num, label
+
+def _format_number_ranges(nums: list[int]) -> str:
+    if not nums: return ""
+    xs = sorted(set(int(n) for n in nums if isinstance(n, int)))
+    if not xs: return ""
+    ranges = []
+    a = b = xs[0]
+    for n in xs[1:]:
+        if n == b + 1:
+            b = n
+        else:
+            ranges.append((a, b))
+            a = b = n
+    ranges.append((a, b))
+    parts = [f"{i}" if i==j else f"{i}-{j}" for i, j in ranges]
+    return ", ".join(parts)
+
 
 
 
