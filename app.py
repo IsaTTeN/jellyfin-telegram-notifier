@@ -2812,6 +2812,77 @@ def _res_display_from_q(q: dict | None) -> str:
     label = _resolution_label(w, h)
     return label or f"{w}x{h}"
 
+#Разрешение для сериалов
+def _get_item_resolution_label(item_id: str) -> str | None:
+    """
+    Возвращает человекочитаемое разрешение (например, '1080p'/'4K' или 'WxH') для одного элемента Jellyfin.
+    Берём первый MediaSource -> первый Video stream.
+    """
+    try:
+        params = {'api_key': JELLYFIN_API_KEY, 'Ids': item_id, 'Fields': 'MediaSources'}
+        url = f"{JELLYFIN_BASE_URL}/emby/Items"
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        item = (r.json().get("Items") or [{}])[0]
+        sources = item.get("MediaSources") or []
+        if not sources:
+            return None
+        streams = sources[0].get("MediaStreams") or []
+        v = next((s for s in streams if (s.get("Type") == "Video")), None)
+        if not v:
+            return None
+        w = v.get("Width") or v.get("PixelWidth")
+        h = v.get("Height") or v.get("PixelHeight")
+        q = {"width": w, "height": h}
+        res = _res_display_from_q(q)
+        return None if (not res or res == "-") else res
+    except Exception as ex:
+        logging.debug(f"_get_item_resolution_label failed for {item_id}: {ex}")
+        return None
+
+
+def _season_resolution_label(season_id: str, *, scan_limit: int | None = None) -> str | None:
+    """
+    Агрегированное разрешение сезона: берём присутствующие эпизоды, считаем (w,h),
+    выбираем самое распространённое; при равенстве — с наибольшей высотой.
+    """
+    try:
+        eps = _season_fetch_episodes(season_id, max_items=scan_limit)
+        present = [ep for ep in eps if _episode_has_file(ep)]
+        if not present:
+            return None
+
+        from collections import Counter
+        dims = []
+
+        for ep in present:
+            sources = ep.get("MediaSources") or []
+            if not sources:
+                continue
+            streams = sources[0].get("MediaStreams") or []
+            v = next((s for s in streams if (s.get("Type") == "Video")), None)
+            if not v:
+                continue
+            w = v.get("Width") or v.get("PixelWidth")
+            h = v.get("Height") or v.get("PixelHeight")
+            if w and h:
+                try:
+                    dims.append((int(w), int(h)))
+                except Exception:
+                    pass
+
+        if not dims:
+            return None
+
+        cnt = Counter(dims)
+        # самое частое; при равном счёте берём с max высотой
+        best = max(cnt.items(), key=lambda kv: (kv[1], kv[0][1]))[0]  # -> (w,h)
+        label = _resolution_label(best[0], best[1]) or f"{best[0]}x{best[1]}"
+        return label
+    except Exception as ex:
+        logging.debug(f"_season_resolution_label failed for season {season_id}: {ex}")
+        return None
+
 #Очистка базы данных
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec='seconds').replace("+00:00", "Z")
@@ -3375,6 +3446,15 @@ def poll_recent_episodes_once():
                         notification_message += f"\n\n*{t('new_ratings_show')}*\n{ratings_text}"
                 if trailer_url:
                     notification_message += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
+
+                # ↓↓↓ добавить это здесь
+                try:
+                    res_label = _season_resolution_label(season_id)
+                    if res_label:
+                        L = _labels()
+                        notification_message += f"\n\n*{L['resolution']}*\n{res_label}"
+                except Exception as ex:
+                    logging.debug(f"(Season) resolution block failed for {season_id}: {ex}")
 
                 if INCLUDE_AUDIO_TRACKS:
                     tracks_block = build_audio_tracks_block_for_season(season_id)
@@ -4225,6 +4305,14 @@ def _notify_season_quality_updated(season_id: str):
             msg += f"\n\n*{t('new_ratings_show')}*\n{ratings_text}"
     if trailer_url:
         msg += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
+
+    try:
+        res_label = _season_resolution_label(season_id)
+        if res_label:
+            L = _labels()
+            msg += f"\n\n*{L['resolution']}*\n{res_label}"
+    except Exception as ex:
+        logging.debug(f"(Season) resolution block failed for {season_id}: {ex}")
 
     if INCLUDE_AUDIO_TRACKS:
         tracks_block = build_audio_tracks_block_for_season(season_id)
