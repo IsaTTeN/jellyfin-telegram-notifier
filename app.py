@@ -148,6 +148,12 @@ ALBUM_POLL_GRACE_MIN = int(os.getenv("ALBUM_POLL_GRACE_MIN", "0"))  # свежи
 ALBUM_TRACKLIST_ENABLED = os.getenv("ALBUM_TRACKLIST_ENABLED", "1").lower() in ("1","true","yes","on")
 ALBUM_TRACKLIST_LIMIT = int(os.getenv("ALBUM_TRACKLIST_LIMIT", "5"))  # максимальное число строк
 ALBUM_TRACKLIST_SHOW_DURATION = os.getenv("ALBUM_TRACKLIST_SHOW_DURATION", "1").lower() in ("1","true","yes","on")
+# --- Books poll ---
+BOOK_POLL_ENABLED = os.getenv("BOOK_POLL_ENABLED", "1").lower() in ("1","true","yes","on")
+BOOK_POLL_INTERVAL_SEC = int(os.getenv("BOOK_POLL_INTERVAL_SEC", "90"))
+BOOK_POLL_PAGE_SIZE = int(os.getenv("BOOK_POLL_PAGE_SIZE", "500"))
+BOOK_POLL_MAX_TOTAL = int(os.getenv("BOOK_POLL_MAX_TOTAL", "0"))  # 0 = без ограничения
+BOOK_POLL_GRACE_MIN = int(os.getenv("BOOK_POLL_GRACE_MIN", "0"))  # 0 — сразу оповещаем кодом
 
 
 # Глобальные переменные
@@ -357,6 +363,25 @@ def _init_quality_db():
                         INTEGER
                     )
                     """)
+        cur.execute("""
+                    CREATE TABLE IF NOT EXISTS book_announced
+                    (
+                        logical_key
+                        TEXT
+                        PRIMARY
+                        KEY,
+                        announced_at
+                        TEXT,
+                        item_id
+                        TEXT,
+                        title
+                        TEXT,
+                        authors
+                        TEXT,
+                        year
+                        INTEGER
+                    )
+                    """)
         # Миграция: добавим episode_count, если столбца нет
         cur.execute("PRAGMA table_info(season_quality)")
         cols = {r[1] for r in cur.fetchall()}
@@ -426,6 +451,9 @@ MESSAGES = {
         "new_track_count": "Tracks",
         "album_tracklist": "Tracklist",
         "album_tracklist_more": "…and {n} more",
+        "new_book_title": "📖New book Added📖",
+        "new_authors": "Author(s)",
+        "new_isbn": "ISBN",
     },
     "ru": {
         "new_movie_title": "🍿Новый фильм добавлен🍿",
@@ -447,6 +475,9 @@ MESSAGES = {
         "new_track_count": "Количество треков",
         "album_tracklist": "Список треков",
         "album_tracklist_more": "…и ещё {n}",
+        "new_book_title": "📖Новая книга добавлена📖",
+        "new_authors": "Автор(ы)",
+        "new_isbn": "ISBN",
     }
 }
 #Выбираем рабочий язык: если заданный отсутствует в MESSAGES — ставим en
@@ -2351,6 +2382,19 @@ def _format_runtime_from_ticks(runtime_ticks) -> str:
         return f"{m}m"
     except Exception:
         return ""
+
+def _format_title_with_year(title: str, year) -> str:
+    """
+    Возвращает 'Title (YYYY)' если год задан, иначе просто 'Title'.
+    Год может прийти None/''/0/строкой.
+    """
+    try:
+        y = ("" if year is None else str(year)).strip()
+    except Exception:
+        y = ""
+    return f"{title} ({y})" if y else title
+
+
 def poll_recent_movies_once():
     """
     Пагинированно тянем фильмы и проверяем апгрейды качества.
@@ -4434,10 +4478,12 @@ def poll_recent_albums_once():
                 mb_id = prov.get('MusicBrainzAlbum')
                 mb_link = f"https://musicbrainz.org/release/{mb_id}" if mb_id else ''
 
+                title_line = _format_title_with_year(name_clean, year)
+
                 notification_message = (
                     f"*{t('new_album_title')}*\n\n"
                     f"*{artist_clean}*\n\n"
-                    f"*{name_clean} ({year})*\n\n"
+                    f"*{title_line}*\n\n"
                     f"{(overview + '\n\n') if overview else ''}"
                 )
                 if runtime:
@@ -4517,6 +4563,203 @@ if ALBUM_POLL_ENABLED:
     threading.Thread(target=_album_poll_loop, name="album-poll", daemon=True).start()
     logging.info(f"Album polling enabled every {ALBUM_POLL_INTERVAL_SEC}s "
                  f"(page={ALBUM_POLL_PAGE_SIZE}, max_total={ALBUM_POLL_MAX_TOTAL}, grace={ALBUM_POLL_GRACE_MIN}m)")
+
+#Отправка книг
+def _book_announced_get(logical_key: str) -> dict | None:
+    try:
+        conn = sqlite3.connect(QUALITY_DB_FILE)
+        cur = conn.cursor()
+        cur.execute("""SELECT logical_key, announced_at, item_id, title, authors, year
+                       FROM book_announced WHERE logical_key=?""", (logical_key,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {"logical_key": row[0], "announced_at": row[1], "item_id": row[2],
+                "title": row[3], "authors": row[4], "year": row[5]}
+    except Exception as ex:
+        logging.debug(f"_book_announced_get failed: {ex}")
+        return None
+    finally:
+        try: conn.close()
+        except: pass
+
+def _book_announced_mark(logical_key: str, *, item_id: str | None, title: str | None,
+                         authors: str | None, year: int | None):
+    try:
+        conn = sqlite3.connect(QUALITY_DB_FILE)
+        cur = conn.cursor()
+        nowz = datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
+        cur.execute("""
+            INSERT INTO book_announced (logical_key, announced_at, item_id, title, authors, year)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(logical_key) DO UPDATE SET
+              announced_at = excluded.announced_at,
+              item_id      = COALESCE(excluded.item_id, book_announced.item_id),
+              title        = COALESCE(excluded.title, book_announced.title),
+              authors      = COALESCE(excluded.authors, book_announced.authors),
+              year         = COALESCE(excluded.year, book_announced.year)
+        """, (logical_key, nowz, item_id, title, authors, year))
+        conn.commit()
+    except Exception as ex:
+        logging.debug(f"_book_announced_mark failed: {ex}")
+    finally:
+        try: conn.close()
+        except: pass
+
+def _book_logical_key(*, isbn: str | None, title: str, authors: str, year: int | None) -> str:
+    if isbn:
+        return f"book:isbn:{isbn.strip()}"
+    a = re.sub(r"\s+", " ", (authors or "").strip().lower())
+    t = re.sub(r"\s+", " ", (title   or "").strip().lower())
+    return f"book:titleauthoryear:{t}–{a}:{year or ''}"
+
+def _extract_book_authors(it: dict) -> list[str]:
+    ppl = it.get("People") or []
+    authors = [p.get("Name") for p in ppl if (p.get("Type") or "").lower() == "author" and p.get("Name")]
+    if not authors:
+        authors = [p.get("Name") for p in ppl if p.get("Name")]
+    # если совсем пусто — вернём []
+    return [a for a in authors if a]
+
+def _extract_isbn(it: dict) -> str | None:
+    prov = it.get("ProviderIds") or {}
+    # встречаются разные ключи, попробуем несколько
+    for k in ("Isbn", "ISBN", "Isbn13", "ISBN13"):
+        if prov.get(k):
+            return str(prov[k]).strip()
+    return None
+
+def poll_recent_books_once():
+    """
+    Ищем новые Book/AudioBook в Jellyfin и шлём уведомления.
+    """
+    page_size = BOOK_POLL_PAGE_SIZE
+    max_total = BOOK_POLL_MAX_TOTAL
+    start = 0
+    fetched = 0
+    now_utc = datetime.now(timezone.utc)
+
+    while True:
+        current_limit = page_size if not max_total else max(0, max_total - fetched)
+        if current_limit == 0:
+            break
+        try:
+            params = {
+                "api_key": JELLYFIN_API_KEY,
+                "IncludeItemTypes": "Book,AudioBook",
+                "Recursive": "true",
+                "SortBy": "DateModified,DateCreated",
+                "SortOrder": "Descending",
+                "Limit": str(current_limit),
+                "StartIndex": str(start),
+                # важно: People/ProviderIds/DateCreated/Overview
+                "Fields": "People,ProviderIds,ProductionYear,Overview,DateCreated"
+            }
+            url = f"{JELLYFIN_BASE_URL}/emby/Items"
+            r = requests.get(url, params=params, timeout=20)
+            r.raise_for_status()
+            items = (r.json() or {}).get("Items") or []
+        except Exception as ex:
+            logging.warning(f"Book poll: failed page start={start}: {ex}")
+            break
+
+        if not items:
+            break
+
+        for it in items:
+            try:
+                item_id = it.get("Id")
+                title = (it.get("Name") or "").strip()
+                year = it.get("ProductionYear")
+                authors_list = _extract_book_authors(it)
+                authors = ", ".join(authors_list) if authors_list else ""
+                isbn = _extract_isbn(it)
+
+                title_clean = re.sub(r"\s+", " ", title).strip()
+                authors_clean = re.sub(r"\s+", " ", authors).strip()
+
+                logical_key = _book_logical_key(
+                    isbn=isbn,
+                    title=title_clean,
+                    authors=authors_clean,
+                    year=year
+                )
+
+                # 1) Уже объявляли? — молча пропустим
+                if _book_announced_get(logical_key):
+                    continue
+
+                # 2) Парсинг дат (без UnboundLocalError)
+                created_iso = it.get("DateCreated")
+                created_dt = None
+                db_created_dt = None
+                try:
+                    created_dt = _parse_iso_dt(created_iso) if created_iso else None
+                except Exception as ex:
+                    logging.debug(f"Book cutoff: item date parse failed for {item_id}: {ex}")
+                try:
+                    db_created_iso = _db_get_created_at_iso()
+                    db_created_dt = _parse_iso_dt(db_created_iso)
+                except Exception as ex:
+                    logging.debug(f"Book cutoff: DB date parse failed: {ex}")
+
+                # 3) Pre-DB cutoff → baseline в БД
+                if db_created_dt and created_dt and (created_dt < db_created_dt):
+                    _book_announced_mark(logical_key, item_id=item_id, title=title_clean,
+                                         authors=authors_clean, year=year)
+                    logging.debug(f"(Book poll) Pre-DB baseline set: {authors_clean} – {title_clean} ({year})")
+                    continue
+
+                # 4) GRACE по времени создания (если нужен)
+                if BOOK_POLL_GRACE_MIN and created_dt:
+                    if (now_utc - created_dt).total_seconds() < BOOK_POLL_GRACE_MIN * 60:
+                        continue
+
+                # 5) Формируем сообщение
+                overview = it.get("Overview") or ""
+                title_line = _format_title_with_year(title_clean, year)
+                notification_message = (
+                    f"*{t('new_book_title')}*\n\n"
+                    f"*{title_line}*\n"
+                )
+                if authors_clean:
+                    notification_message += f"\n*{t('new_authors')}*\n{authors_clean}\n"
+                if isbn:
+                    notification_message += f"\n*{t('new_isbn')}*\n{isbn}\n"
+                if overview:
+                    notification_message += f"\n{overview}\n"
+
+                send_notification(item_id, notification_message)
+
+                # 6) Помечаем в БД
+                _book_announced_mark(logical_key, item_id=item_id, title=title_clean,
+                                     authors=authors_clean, year=year)
+                logging.info(f"(Book poll) NEW book: {authors_clean} – {title_clean} ({year})")
+            except Exception as ex:
+                logging.warning(f"Book poll: item {it.get('Id')} failed: {ex}")
+
+        n = len(items)
+        fetched += n
+        start += n
+        if max_total and fetched >= max_total:
+            break
+        if n < current_limit:
+            break
+
+def _book_poll_loop():
+    while True:
+        try:
+            wait_until_scan_idle("book poll")
+            poll_recent_books_once()
+        except Exception as ex:
+            logging.warning(f"Book poll loop error: {ex}")
+        time.sleep(BOOK_POLL_INTERVAL_SEC)
+
+if BOOK_POLL_ENABLED:
+    threading.Thread(target=_book_poll_loop, name="book-poll", daemon=True).start()
+    logging.info(f"Book polling enabled every {BOOK_POLL_INTERVAL_SEC}s "
+                 f"(page={BOOK_POLL_PAGE_SIZE}, max_total={BOOK_POLL_MAX_TOTAL}, grace={BOOK_POLL_GRACE_MIN}m)")
+
 
 
 @app.route("/webhook", methods=["POST"])
