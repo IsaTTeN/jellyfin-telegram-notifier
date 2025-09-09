@@ -12,7 +12,7 @@ import smtplib
 from requests.exceptions import HTTPError
 from flask import Flask, request
 from dotenv import load_dotenv
-from apprise import Apprise
+#from apprise import Apprise
 from urllib.parse import quote
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
@@ -190,12 +190,12 @@ MVID_POLL_GRACE_MIN = int(os.getenv("MVID_POLL_GRACE_MIN", "0"))  # 0 — опо
 imgbb_upload_done = threading.Event()   # Сигнал о завершении загрузки
 uploaded_image_url = None               # Здесь хранится ссылка после удачной загрузки
 # Gotify больше не добавляем в APPRISE_URLS вообще!
-APPRISE_OTHER_URLS = os.environ.get("APPRISE_OTHER_URLS", "")
-APPRISE_URLS = APPRISE_OTHER_URLS.strip()
+#APPRISE_OTHER_URLS = os.environ.get("APPRISE_OTHER_URLS", "")
+#APPRISE_URLS = APPRISE_OTHER_URLS.strip()
 
-apobj = Apprise()
-for url in APPRISE_URLS.split():
-    apobj.add(url)
+#apobj = Apprise()
+#for url in APPRISE_URLS.split():
+#    apobj.add(url)
 
 # Path for the JSON file to store notified items
 #notified_items_file = '/app/data/notified_items.json'
@@ -1346,48 +1346,48 @@ def send_notification(photo_id, caption):
     except Exception as wa_ex:
         logging.warning(f"WhatsApp send block failed: {wa_ex}")
 
-    other_services = [url for url in APPRISE_URLS.split() if url]  # убираем пустые строки
-    if other_services:
-        apprise_obj = Apprise()
-        for url in other_services:
-            apprise_obj.add(url)
+#    other_services = [url for url in APPRISE_URLS.split() if url]  # убираем пустые строки
+#    if other_services:
+#        apprise_obj = Apprise()
+#        for url in other_services:
+#            apprise_obj.add(url)
 
         # Готовим временный файл для картинки (если фото есть)
 
-    base_photo_url = f"{JELLYFIN_BASE_URL}/Items/{photo_id}/Images/Primary"
-    attach_param = None
-    try:
-        image_response = requests.get(base_photo_url, timeout=10)
-        if image_response.ok:
-            # Сохраняем изображение во временный файл
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-                tmp.write(image_response.content)
-                tmp_path = tmp.name
-            attach_param = tmp_path
-        else:
-            attach_param = None
-    except Exception as ex:
-        logging.warning(f"Cannot download image: {ex}")
-        attach_param = None
+#    base_photo_url = f"{JELLYFIN_BASE_URL}/Items/{photo_id}/Images/Primary"
+#    attach_param = None
+#    try:
+#        image_response = requests.get(base_photo_url, timeout=10)
+#        if image_response.ok:
+#            # Сохраняем изображение во временный файл
+#            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+#                tmp.write(image_response.content)
+#                tmp_path = tmp.name
+#            attach_param = tmp_path
+#        else:
+#            attach_param = None
+#    except Exception as ex:
+#        logging.warning(f"Cannot download image: {ex}")
+#        attach_param = None
 
-    caption_plain = clean_markdown_for_apprise(caption)
-    result = apobj.notify(
-        body=caption_plain,
-        title="",
-        attach=attach_param
-    )
+#    caption_plain = clean_markdown_for_apprise(caption)
+#    result = apobj.notify(
+#        body=caption_plain,
+#        title="",
+#        attach=attach_param
+#    )
 
-    if attach_param and os.path.exists(attach_param):
-        try:
-            os.remove(attach_param)
-        except Exception as ex:
-            logging.warning(f"Cannot remove temp image: {ex}")
+#    if attach_param and os.path.exists(attach_param):
+#        try:
+#            os.remove(attach_param)
+#        except Exception as ex:
+#            logging.warning(f"Cannot remove temp image: {ex}")
 
-    if result:
-        logging.info("Notification sent via Apprise")
-    else:
-        logging.warning("Notification failed via Apprise")
-    return None
+#    if result:
+#        logging.info("Notification sent via Apprise")
+#    else:
+#        logging.warning("Notification failed via Apprise")
+#    return None
 def _fetch_jellyfin_image_with_retries(photo_id: str, attempts: int = 3, timeout: int = 10, delay: float = 1.5):
     """
     Пытается скачать Primary-постер из Jellyfin с повторами.
