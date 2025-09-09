@@ -942,6 +942,74 @@ def sanitize_whatsapp_text(text: str) -> str:
 
     return text
 
+def markdown_to_pushover_html(text: str) -> str:
+    """
+    Конвертирует «упрощённый Markdown» ваших уведомлений в HTML,
+    совместимый с Pushover (поддерживаются: <b>, <i>, <u>, <a>).
+    - Ссылки [текст](url) -> <a href="url">текст</a>
+    - Жирный: **…** и строка формата *…* на отдельной строке -> <b>…</b>
+    - Курсив: *…* и _…_ -> <i>…</i>
+    - Заголовки '# ' в начале строки -> <b>…</b>
+    - Маркеры списков "- " / "* " -> "• "
+    - Бэктики `…` — убираются (содержимое оставляем как есть, уже экранировано)
+    - Переходы строк: \n (теги <br> Pushover не поддерживает)
+    Весь неразмеченный текст HTML-экранируется.
+    """
+    if not text:
+        return ""
+
+    s = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    def _esc(t: str) -> str:
+        return (t.replace("&", "&amp;")
+                 .replace("<", "&lt;")
+                 .replace(">", "&gt;")
+                 .replace('"', "&quot;"))
+
+    # 0) Экранируем всё (чтобы не ломать HTML), дальше вставляем ТОЛЬКО наши теги
+    s = _esc(s)
+
+    import re
+
+    # 1) Ссылки: [text](https://url)
+    def _link_repl(m: re.Match) -> str:
+        txt = m.group(1)
+        url = m.group(2)
+        # эскейп для href
+        url = url.replace("&", "&amp;").replace('"', "&quot;").strip()
+        return f'<a href="{url}">{txt}</a>'
+    s = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", _link_repl, s)
+
+    # 2) Жирный: **…**
+    s = re.sub(r"\*\*(.+?)\*\*", lambda m: f"<b>{m.group(1)}</b>", s)
+
+    # 3) Жирная «цельная строка» в стиле ваших заголовков: *…* на отдельной строке
+    s = re.sub(r"(?m)^\*\s*(.+?)\s*\*$", lambda m: f"<b>{m.group(1)}</b>", s)
+
+    # 4) Жирный альтернативный: __…__
+    s = re.sub(r"__(.+?)__", lambda m: f"<b>{m.group(1)}</b>", s)
+
+    # 5) Курсив: *…* (внутри строки) — после обработки «цельной строки»
+    s = re.sub(r"\*(.+?)\*", lambda m: f"<i>{m.group(1)}</i>", s)
+
+    # 6) Курсив: _…_
+    s = re.sub(r"_(.+?)_", lambda m: f"<i>{m.group(1)}</i>", s)
+
+    # 7) Заголовки: '# ' в начале строки -> <b>…</b>
+    s = re.sub(r"(?m)^#\s+(.*)$", lambda m: f"<b>{m.group(1)}</b>", s)
+
+    # 8) Маркеры списков -> буллет
+    s = re.sub(r"(?m)^\s*[-*]\s+", "• ", s)
+
+    # 9) Убрать инлайн-кодовые бэктики (содержимое уже экранировано на шаге 0)
+    s = re.sub(r"`(.+?)`", r"\1", s)
+
+    # 10) Схлопываем лишние тройные переводы в двойные (аккуратнее выглядит)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+
+    return s
+
+
 def send_email_with_image_jellyfin(photo_id: str, subject: str, body_markdown: str):
     """
     Отправляет email с:
@@ -1279,14 +1347,15 @@ def send_notification(photo_id, caption):
             # опционально: вытащим заголовок из первой жирной строки сообщения
             img_bytes = _safe_fetch_jellyfin_image_bytes(photo_id)  # <— напрямую из Jellyfin
             # uploaded_url — ваш уже известный URL постера (если есть)
+            html_msg = markdown_to_pushover_html(caption or "")
             send_pushover_message(
-                message=caption_plain,
+                message=html_msg,
                 title=_title,
                 image_bytes=img_bytes,  # <— передаём байты, никаких i.ibb.co
                 sound=(PUSHOVER_SOUND or None),
                 priority=PUSHOVER_PRIORITY,
                 device=(PUSHOVER_DEVICE or None),
-                html=False
+                html=True
             )
     except Exception as ex:
         logging.warning(f"Pushover wrapper failed: {ex}")
