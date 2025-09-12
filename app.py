@@ -98,6 +98,11 @@ PUSHOVER_HTML     = os.getenv("PUSHOVER_HTML", "0").lower() in ("1","true","yes"
 # если будете использовать экстренный приоритет (2)
 PUSHOVER_EMERGENCY_RETRY  = int(os.getenv("PUSHOVER_EMERGENCY_RETRY",  "60"))   # >= 30 сек
 PUSHOVER_EMERGENCY_EXPIRE = int(os.getenv("PUSHOVER_EMERGENCY_EXPIRE", "600"))  # сек
+# --- Pushover retry/timing ---
+PUSHOVER_TIMEOUT_SEC        = float(os.getenv("PUSHOVER_TIMEOUT_SEC", "10"))   # таймаут одного запроса
+PUSHOVER_RETRIES            = int(os.getenv("PUSHOVER_RETRIES", "3"))          # сколько попыток всего
+PUSHOVER_RETRY_BASE_DELAY   = float(os.getenv("PUSHOVER_RETRY_BASE_DELAY", "0.7"))  # стартовая пауза, сек
+PUSHOVER_RETRY_BACKOFF      = float(os.getenv("PUSHOVER_RETRY_BACKOFF", "1.8"))     # множитель экспоненты
 
 # Куда слать по умолчанию:
 # для мобильного приложения указывайте notify/<имя_сервиса>, напр. "notify/mobile_app_m2007j20cg"
@@ -1975,9 +1980,9 @@ def send_pushover_message(message: str,
                           device: str | None = None,
                           html: bool = False) -> bool:
     """
-    Отправка уведомления в Pushover.
-    Если переданы image_bytes — используем их напрямую (без сетевых скачиваний).
-    Иначе (как запасной вариант) попробуем image_url с коротким таймаутом.
+    Отправка уведомления в Pushover с ретраями на временные ошибки/таймауты.
+    - Ретрай при: requests.Timeout/ConnectionError, HTTP 5xx, HTTP 429.
+    - Пауза: экспоненциальная (base * backoff^(attempt-1)).
     """
     try:
         if not (PUSHOVER_USER_KEY and PUSHOVER_TOKEN):
@@ -2004,6 +2009,7 @@ def send_pushover_message(message: str,
             data["html"] = "1"
 
         files = None
+        # используем уже подготовленные байты; fallback на скачивание по URL оставляем коротким
         if image_bytes:
             files = {"attachment": ("poster.jpg", image_bytes, "image/jpeg")}
         elif image_url:
@@ -2019,17 +2025,53 @@ def send_pushover_message(message: str,
             except Exception as ex:
                 logging.warning(f"Pushover: image fetch failed: {ex}")
 
-        resp = requests.post(endpoint, data=data, files=files, timeout=10)
-        if resp.status_code != 200:
-            logging.warning(f"Pushover failed {resp.status_code}: {resp.text[:300]}")
-            return False
+        # --- Ретраи на отправку ---
+        import time
+        from requests.exceptions import Timeout, ConnectionError
 
-        logging.info("Pushover notification sent")
-        return True
+        attempts = max(1, PUSHOVER_RETRIES)
+        delay = max(0.0, PUSHOVER_RETRY_BASE_DELAY)
+        for attempt in range(1, attempts + 1):
+            try:
+                resp = requests.post(
+                    endpoint,
+                    data=data,
+                    files=files,
+                    timeout=PUSHOVER_TIMEOUT_SEC,
+                    allow_redirects=True
+                )
+                # успех
+                if resp.status_code == 200:
+                    logging.info("Pushover notification sent")
+                    return True
+
+                # решаем, нужно ли повторять
+                retryable_http = resp.status_code in (429, 500, 502, 503, 504)
+                if not retryable_http or attempt == attempts:
+                    logging.warning(f"Pushover failed {resp.status_code}: {resp.text[:300]}")
+                    return False
+
+                logging.warning(f"Pushover HTTP {resp.status_code}, retry {attempt}/{attempts}...")
+            except (Timeout, ConnectionError) as ex:
+                if attempt == attempts:
+                    logging.warning(f"Pushover notify error: {ex}")
+                    return False
+                logging.warning(f"Pushover network error, retry {attempt}/{attempts}: {ex}")
+            except Exception as ex:
+                # прочее — не ретраим
+                logging.warning(f"Pushover notify error: {ex}")
+                return False
+
+            # пауза перед следующей попыткой
+            time.sleep(delay)
+            delay *= max(1.0, PUSHOVER_RETRY_BACKOFF)
+
+        return False  # теоретически не дойдём
 
     except Exception as ex:
         logging.warning(f"Pushover notify error: {ex}")
         return False
+
 
 def _safe_fetch_jellyfin_image_bytes(item_id: str) -> bytes | None:
     """
