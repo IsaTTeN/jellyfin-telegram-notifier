@@ -106,6 +106,12 @@ HA_DEFAULT_SERVICE = os.getenv("HA_DEFAULT_SERVICE", "persistent_notification/cr
 # Показывать ссылку на постер в persistent_notification
 HA_PN_IMAGE_LINK = os.getenv("HA_PN_IMAGE_LINK", "1").lower() in ("1","true","yes","on")
 HA_PN_IMAGE_LABEL = os.getenv("HA_PN_IMAGE_LABEL", "Poster")  # Заголовок перед ссылкой
+# --- Jellyfin: In-App сообщения (в клиент) ---
+JELLYFIN_INAPP_ENABLED = os.getenv("JELLYFIN_INAPP_ENABLED", "1") == "1"
+JELLYFIN_INAPP_TIMEOUT_MS = int(os.getenv("JELLYFIN_INAPP_TIMEOUT_MS", "800"))      # сколько висит поп-ап
+JELLYFIN_INAPP_ACTIVE_WITHIN_SEC = int(os.getenv("JELLYFIN_INAPP_ACTIVE_WITHIN_SEC", "900"))  # «активность» сессии
+JELLYFIN_INAPP_TITLE = os.getenv("JELLYFIN_INAPP_TITLE", "Jellyfin")
+JELLYFIN_INAPP_FORCE_MODAL = os.getenv("JELLYFIN_INAPP_FORCE_MODAL", "1").lower() in ("1","true","yes","on")
 
 #выключение контроля добавленного контента
 DISABLE_DEDUP = os.getenv("NOTIFIER_DISABLE_DEDUP", "0").lower() in ("1", "true", "yes")
@@ -909,6 +915,68 @@ def clean_markdown_for_apprise(text):
 
     return text
 
+def _extract_bold_line(line: str) -> str | None:
+    m = re.fullmatch(r"\*\s*(.+?)\s*\*", (line or "").strip())
+    return m.group(1).strip() if m else None
+
+def make_jf_inapp_payload_from_caption(caption: str) -> tuple[str, str]:
+    """
+    Из Markdown-сообщения собирает:
+      header -> первая жирная строка (*...*)
+      title  -> вторая жирная строка (*...*)
+      overview -> все строки после title до следующей жирной секции/конца
+    Возвращает (header, text) где text = "title\\n\\noverview" (без Markdown).
+    Если чего-то нет — gracefully деградируем.
+    """
+    caption = caption or ""
+    lines = caption.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+    # 1) найти header
+    i = 0
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    header = _extract_bold_line(lines[i]) if i < len(lines) else None
+    if header is None:
+        # нет жирной строки — берём первый непустой как "title", а header — дефолт
+        first_non_empty = next((ln for ln in lines if ln.strip()), "")
+        title_plain = clean_markdown_for_apprise(first_non_empty)
+        header_plain = "Jellyfin"
+        return header_plain, title_plain
+
+    i += 1
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+
+    # 2) найти title (вторая жирная строка)
+    title_md = _extract_bold_line(lines[i]) if i < len(lines) else None
+    i += 1 if title_md is not None else 0
+
+    # 3) собрать overview до следующей жирной секции
+    overview_parts = []
+    while i < len(lines):
+        ln = lines[i]
+        if _extract_bold_line(ln) is not None:
+            break  # началась следующая секция (*...*)
+        overview_parts.append(ln)
+        i += 1
+
+    # 4) очистить Markdown → plain
+    header_plain = clean_markdown_for_apprise(header)
+    title_plain  = clean_markdown_for_apprise(title_md) if title_md else ""
+    overview_plain = clean_markdown_for_apprise("\n".join(overview_parts)).strip()
+
+    # Итоговый текст для Jellyfin: только название и описание
+    text = title_plain if title_plain else ""
+    if overview_plain:
+        text = (text + ("\n\n" if text else "")) + overview_plain
+
+    # Fallback, если вдруг всё пусто
+    if not text:
+        text = clean_markdown_for_apprise(caption)[:500]
+
+    return header_plain or "Jellyfin", text
+
+
 def sanitize_whatsapp_text(text: str) -> str:
     if not text:
         return text
@@ -1323,6 +1391,17 @@ def send_notification(photo_id, caption):
     except Exception as sl_ex:
         logging.warning(f"Slack send failed: {sl_ex}")
     # ======================================================
+#отправка в jellyfin
+    try:
+        if JELLYFIN_INAPP_ENABLED:
+            # Для клиентов Jellyfin лучше plain text без Markdown
+            jf_header, jf_text = make_jf_inapp_payload_from_caption(caption or "")
+            send_jellyfin_inapp_message(
+                message=jf_text,
+                title=jf_header
+            )
+    except Exception as ex:
+        logging.warning(f"Jellyfin in-app notify failed: {ex}")
 #Отправка в home assistant
     try:
         if HA_BASE_URL and HA_TOKEN:
@@ -5582,6 +5661,64 @@ def _maybe_send_onboarding_congrats():
     except Exception as ex:
         logging.warning(f"Onboarding congrats check failed: {ex}")
 
+#отправка сообщения в jellyfin
+def _jf_list_active_sessions(active_within_sec: int) -> list:
+    """Возвращает список активных сессий Jellyfin за N секунд."""
+    try:
+        params = {
+            "api_key": JELLYFIN_API_KEY,
+            "ActiveWithinSeconds": str(active_within_sec)
+        }
+        r = requests.get(f"{JELLYFIN_BASE_URL}/Sessions", params=params, timeout=10)
+        r.raise_for_status()
+        return r.json() or []
+    except Exception as ex:
+        logging.warning(f"JF sessions fetch failed: {ex}")
+        return []
+
+def _jf_send_session_message(session_id: str, header: str, text: str, timeout_ms: int) -> bool:
+    try:
+        url = f"{JELLYFIN_BASE_URL}/Sessions/{session_id}/Message"
+        headers = {"X-MediaBrowser-Token": JELLYFIN_API_KEY}
+        payload = {"Header": header or "", "Text": text or ""}
+
+        # Добавляем TimeoutMs только если явно хотим «toast»
+        # Если включён форс-модалки или timeout_ms <= 0 — НЕ добавляем поле вовсе
+        if not JELLYFIN_INAPP_FORCE_MODAL and (timeout_ms is not None) and (int(timeout_ms) > 0):
+            payload["TimeoutMs"] = int(timeout_ms)
+
+        r = requests.post(url, headers=headers, json=payload, timeout=8)
+        if r.status_code not in (200, 204):
+            logging.warning(f"JF message {session_id} failed {r.status_code}: {r.text[:200]}")
+            return False
+        return True
+    except Exception as ex:
+        logging.warning(f"JF session message error {session_id}: {ex}")
+        return False
+
+def send_jellyfin_inapp_message(message: str, title: str | None = None) -> bool:
+    """Отправляет сообщение во ВСЕ активные сессии (за заданный период)."""
+    if not (JELLYFIN_INAPP_ENABLED and JELLYFIN_BASE_URL and JELLYFIN_API_KEY):
+        return False
+    header = (title or JELLYFIN_INAPP_TITLE or "Jellyfin")[:120]
+    sessions = _jf_list_active_sessions(JELLYFIN_INAPP_ACTIVE_WITHIN_SEC)
+    if not sessions:
+        logging.info("Jellyfin in-app: нет активных сессий — сообщение пропущено")
+        return False
+
+    ok_any = False
+    for s in sessions:
+        sid = s.get("Id") or s.get("SessionId") or s.get("Id")
+        if not sid:
+            continue
+        if _jf_send_session_message(sid, header, message, JELLYFIN_INAPP_TIMEOUT_MS):
+            ok_any = True
+
+    if ok_any:
+        logging.info(f"Jellyfin in-app: отправлено в {len(sessions)} сесс.")
+    else:
+        logging.warning("Jellyfin in-app: все попытки доставки неуспешны")
+    return ok_any
 
 
 
