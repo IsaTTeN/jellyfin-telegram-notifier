@@ -112,6 +112,22 @@ JELLYFIN_INAPP_TIMEOUT_MS = int(os.getenv("JELLYFIN_INAPP_TIMEOUT_MS", "800"))  
 JELLYFIN_INAPP_ACTIVE_WITHIN_SEC = int(os.getenv("JELLYFIN_INAPP_ACTIVE_WITHIN_SEC", "900"))  # «активность» сессии
 JELLYFIN_INAPP_TITLE = os.getenv("JELLYFIN_INAPP_TITLE", "Jellyfin")
 JELLYFIN_INAPP_FORCE_MODAL = os.getenv("JELLYFIN_INAPP_FORCE_MODAL", "1").lower() in ("1","true","yes","on")
+# --- Reddit ---
+REDDIT_ENABLED     = os.getenv("REDDIT_ENABLED", "1").lower() in ("1","true","yes","on")
+REDDIT_APP_ID      = os.getenv("REDDIT_APP_ID", "")
+REDDIT_APP_SECRET  = os.getenv("REDDIT_APP_SECRET", "")
+REDDIT_USERNAME    = os.getenv("REDDIT_USERNAME", "")
+REDDIT_PASSWORD    = os.getenv("REDDIT_PASSWORD", "")
+REDDIT_SUBREDDIT   = os.getenv("REDDIT_SUBREDDIT", "MySubJellynotify")     # без /r/
+REDDIT_USER_AGENT  = os.getenv("REDDIT_USER_AGENT", "jellyfin-bot/1.0 (by u/your_username)")
+# опционально
+REDDIT_SEND_REPLIES = os.getenv("REDDIT_SEND_REPLIES", "1").lower() in ("1","true","yes","on")
+REDDIT_SPOILER      = os.getenv("REDDIT_SPOILER", "0").lower() in ("1","true","yes","on")
+REDDIT_NSFW         = os.getenv("REDDIT_NSFW", "0").lower() in ("1","true","yes","on")
+# --- Reddit post mode ---
+# 1 = как сейчас: пост-ссылка (картинка), а описание — отдельным комментарием
+# 0 = старый вариант: self-post, сверху ссылка на постер, ниже описание в том же посте
+REDDIT_SPLIT_TO_COMMENT = os.getenv("REDDIT_SPLIT_TO_COMMENT", "1").lower() in ("1","true","yes","on")
 
 #выключение контроля добавленного контента
 DISABLE_DEDUP = os.getenv("NOTIFIER_DISABLE_DEDUP", "0").lower() in ("1", "true", "yes")
@@ -976,6 +992,40 @@ def make_jf_inapp_payload_from_caption(caption: str) -> tuple[str, str]:
 
     return header_plain or "Jellyfin", text
 
+def _split_caption_for_reddit(caption: str) -> tuple[str, str]:
+    """
+    Возвращает (title, body_md) для Reddit:
+      - title: первая жирная строка (*...*) — «шапка» (например, New Movie Added)
+      - body_md: caption БЕЗ «шапки». Начинается с второй жирной строки (название), затем текст.
+    Если «шапки» нет — title='Jellyfin', body=исходный caption.
+    """
+    import re
+    caption = (caption or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = caption.split("\n")
+
+    # найти первую жирную строку (*...*)
+    header = None
+    hdr_idx = None
+    for i, ln in enumerate(lines):
+        m = re.fullmatch(r"\*\s*(.+?)\s*\*", ln.strip())
+        if m:
+            header = m.group(1).strip()
+            hdr_idx = i
+            break
+
+    if header is None:
+        return "Jellyfin", caption
+
+    # тело = всё, кроме первой жирной строки (шапки)
+    body = "\n".join(lines[:hdr_idx] + lines[hdr_idx+1:])
+    # подчистим ведущие пустые строки
+    while body.startswith("\n"):
+        body = body[1:]
+    while body.startswith("\n\n"):
+        body = body[2:]
+    return header or "Jellyfin", body.strip()
+
+
 
 def sanitize_whatsapp_text(text: str) -> str:
     if not text:
@@ -1391,6 +1441,29 @@ def send_notification(photo_id, caption):
     except Exception as sl_ex:
         logging.warning(f"Slack send failed: {sl_ex}")
     # ======================================================
+#Отпрака в reddit
+    try:
+        if REDDIT_ENABLED:
+            # Заголовок = «шапка» (первая жирная строка), тело = caption БЕЗ «шапки»
+            post_title, body_md = _split_caption_for_reddit(caption or "")
+            external_url = uploaded_url or None  # прямой URL на постер (если есть)
+
+            if REDDIT_SPLIT_TO_COMMENT and external_url:
+                # Режим 1: пост-ссылка (картинка), описание — комментарием
+                send_reddit_link_post_with_comment(
+                    title=post_title,
+                    url=external_url,
+                    body_markdown=body_md
+                )
+            else:
+                # Режим 0: обычный self-post; если есть URL — поставим его первой строкой в самом посте
+                send_reddit_post(
+                    title=post_title,
+                    body_markdown=body_md,
+                    external_image_url=external_url  # может быть None — тогда просто текст
+                )
+    except Exception as ex:
+        logging.warning(f"Reddit wrapper failed: {ex}")
 #отправка в jellyfin
     try:
         if JELLYFIN_INAPP_ENABLED:
@@ -5719,6 +5792,162 @@ def send_jellyfin_inapp_message(message: str, title: str | None = None) -> bool:
     else:
         logging.warning("Jellyfin in-app: все попытки доставки неуспешны")
     return ok_any
+
+#Отправка в reddit
+_reddit_oauth_cache = {"token": None, "exp": 0}
+
+def _reddit_get_token() -> str | None:
+    """
+    Получить (и кэшировать) bearer-токен через password grant для script-app.
+    Нужен скоуп 'submit'.
+    """
+    try:
+        import time
+        now = int(time.time())
+        if _reddit_oauth_cache["token"] and now < _reddit_oauth_cache["exp"] - 20:
+            return _reddit_oauth_cache["token"]
+
+        if not all([REDDIT_APP_ID, REDDIT_APP_SECRET, REDDIT_USERNAME, REDDIT_PASSWORD]):
+            return None
+
+        data = {
+            "grant_type": "password",
+            "username": REDDIT_USERNAME,
+            "password": REDDIT_PASSWORD,
+        }
+        # Basic-авторизация client_id:client_secret + обязательный User-Agent
+        r = requests.post(
+            "https://www.reddit.com/api/v1/access_token",
+            data=data,
+            auth=(REDDIT_APP_ID, REDDIT_APP_SECRET),
+            headers={"User-Agent": REDDIT_USER_AGENT},
+            timeout=12
+        )
+        r.raise_for_status()
+        j = r.json()
+        tok = j.get("access_token")
+        exp = now + int(j.get("expires_in", 3600))
+        if tok:
+            _reddit_oauth_cache.update({"token": tok, "exp": exp})
+        return tok
+    except Exception as ex:
+        logging.warning(f"Reddit OAuth failed: {ex}")
+        return None
+
+
+def send_reddit_post(title: str, body_markdown: str, external_image_url: str | None = None) -> bool:
+    """
+    Публикует self-post в Reddit. Если передан external_image_url,
+    ставим его первой строкой (без Markdown) — Reddit обычно покажет превью.
+    """
+    try:
+        if not (REDDIT_ENABLED and REDDIT_SUBREDDIT):
+            return False
+
+        token = _reddit_get_token()
+        if not token:
+            return False
+
+        headers = {"Authorization": f"bearer {token}", "User-Agent": REDDIT_USER_AGENT}
+
+        text = body_markdown or ""
+        if external_image_url:
+            url = external_image_url.strip()
+            link_line = f"[Poster]({url})"
+            # чтобы не дублировать, если уже вставлено
+            if not (text.startswith(link_line) or text.startswith(url)):
+                text = link_line + ("\n\n" if text else "") + text
+
+        data = {
+            "sr": REDDIT_SUBREDDIT,
+            "kind": "self",
+            "title": (title or "")[:300],
+            "text": text,
+            "resubmit": "true",
+            "sendreplies": "true" if REDDIT_SEND_REPLIES else "false",
+            "spoiler": "true" if REDDIT_SPOILER else "false",
+            "nsfw": "true" if REDDIT_NSFW else "false",
+            "api_type": "json",
+        }
+
+        r = requests.post("https://oauth.reddit.com/api/submit", headers=headers, data=data, timeout=20)
+        if r.status_code != 200:
+            logging.warning(f"Reddit submit HTTP {r.status_code}: {r.text[:300]}")
+            return False
+
+        jr = r.json().get("json", {})
+        errs = jr.get("errors") or []
+        if errs:
+            logging.warning(f"Reddit submit errors: {errs}")
+            return False
+
+        logging.info("Reddit post submitted successfully")
+        return True
+
+    except Exception as ex:
+        logging.warning(f"Reddit submit failed: {ex}")
+        return False
+
+def send_reddit_link_post_with_comment(title: str, url: str, body_markdown: str | None = None) -> bool:
+    """
+    Делает ссылочный пост (kind=link) с изображением-URL.
+    Reddit отрисует превью/картинку. Затем добавляем комментарий с текстом.
+    """
+    try:
+        if not (REDDIT_ENABLED and REDDIT_SUBREDDIT and url):
+            return False
+
+        token = _reddit_get_token()
+        if not token:
+            return False
+
+        headers = {"Authorization": f"bearer {token}", "User-Agent": REDDIT_USER_AGENT}
+
+        submit_data = {
+            "sr": REDDIT_SUBREDDIT,
+            "kind": "link",
+            "title": (title or "")[:300],
+            "url": url.strip(),
+            "resubmit": "true",
+            "sendreplies": "true" if REDDIT_SEND_REPLIES else "false",
+            "spoiler": "true" if REDDIT_SPOILER else "false",
+            "nsfw": "true" if REDDIT_NSFW else "false",
+            "api_type": "json",
+        }
+        r = requests.post("https://oauth.reddit.com/api/submit", headers=headers, data=submit_data, timeout=20)
+        if r.status_code != 200:
+            logging.warning(f"Reddit link submit HTTP {r.status_code}: {r.text[:300]}")
+            return False
+
+        jr = r.json().get("json", {})
+        errs = jr.get("errors") or []
+        if errs:
+            logging.warning(f"Reddit link submit errors: {errs}")
+            return False
+
+        data = jr.get("data") or {}
+        thing_id = data.get("name") or (f"t3_{data.get('id')}" if data.get('id') else None)
+
+        if thing_id and body_markdown:
+            cdata = {"thing_id": thing_id, "text": body_markdown, "api_type": "json"}
+            cr = requests.post("https://oauth.reddit.com/api/comment", headers=headers, data=cdata, timeout=20)
+            if cr.status_code != 200:
+                logging.warning(f"Reddit comment HTTP {cr.status_code}: {cr.text[:300]}")
+            else:
+                ce = (cr.json().get("json") or {}).get("errors") or []
+                if ce:
+                    logging.warning(f"Reddit comment errors: {ce}")
+
+        logging.info("Reddit link post submitted successfully")
+        return True
+
+    except Exception as ex:
+        logging.warning(f"Reddit link submit failed: {ex}")
+        return False
+
+
+
+
 
 
 
