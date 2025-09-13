@@ -33,6 +33,40 @@ log_directory = 'A:/git'
 log_filename = os.path.join(log_directory, 'jellyfin_telegram-notifier.log')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Сколько дней держать ротации (по умолчанию 5), можно переопределить через ENV
+LOG_RETENTION_DAYS = int(os.getenv("LOG_RETENTION_DAYS", "3"))
+
+def _cleanup_rotated_logs(base_log_path: str, retain_days: int = LOG_RETENTION_DAYS) -> None:
+    """
+    Удаляет файлы вида 'jellyfin_telegram-notifier.log.YYYY-MM-DD' старше retain_days.
+    Не трогает основной файл '...log'.
+    """
+    try:
+        dirpath = os.path.dirname(base_log_path) or "."
+        basename = os.path.basename(base_log_path)  # jellyfin_telegram-notifier.log
+        # Матчим только суффикс .YYYY-MM-DD
+        pattern = re.compile(rf"^{re.escape(basename)}\.(\d{{4}}-\d{{2}}-\d{{2}})$")
+        cutoff = (datetime.now().date() - timedelta(days=max(0, int(retain_days))))
+
+        for name in os.listdir(dirpath):
+            m = pattern.match(name)
+            if not m:
+                continue
+            date_str = m.group(1)
+            try:
+                d = datetime.strptime(date_str, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if d < cutoff:
+                full = os.path.join(dirpath, name)
+                try:
+                    os.remove(full)
+                    logging.info(f"Log cleanup: removed old rotation {name}")
+                except Exception as ex:
+                    logging.warning(f"Log cleanup: failed to remove {name}: {ex}")
+    except Exception as ex:
+        logging.warning(f"Log cleanup failed: {ex}")
+
 # Ensure the log directory exists
 os.makedirs(log_directory, exist_ok=True)
 
@@ -43,6 +77,9 @@ rotating_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %
 
 # Add the rotating handler to the logger
 logging.getLogger().addHandler(rotating_handler)
+
+# Очистить старые ротации (по умолчанию старше 5 дней)
+_cleanup_rotated_logs(log_filename, retain_days=LOG_RETENTION_DAYS)
 
 # Constants
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
