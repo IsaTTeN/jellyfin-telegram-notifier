@@ -29,7 +29,7 @@ app = Flask(__name__)
 
 # Set up logging
 #log_directory = '/app/log'
-log_directory = 'A:/git'
+log_directory = 'A:/git/log'
 log_filename = os.path.join(log_directory, 'jellyfin_telegram-notifier.log')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
