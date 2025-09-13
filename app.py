@@ -21,6 +21,8 @@ from datetime import datetime, timedelta, timezone
 from collections import Counter, OrderedDict
 import sqlite3
 import hashlib
+from urllib.parse import urlparse
+import ipaddress
 
 load_dotenv()
 app = Flask(__name__)
@@ -133,7 +135,16 @@ REDDIT_NSFW         = os.getenv("REDDIT_NSFW", "0").lower() in ("1","true","yes"
 # 1 = как сейчас: пост-ссылка (картинка), а описание — отдельным комментарием
 # 0 = старый вариант: self-post, сверху ссылка на постер, ниже описание в том же посте
 REDDIT_SPLIT_TO_COMMENT = os.getenv("REDDIT_SPLIT_TO_COMMENT", "1").lower() in ("1","true","yes","on")
-
+# --- Synology Chat ---
+SYNOCHAT_ENABLED       = os.getenv("SYNOCHAT_ENABLED", "1").lower() in ("1","true","yes","on")
+SYNOCHAT_WEBHOOK_URL   = os.getenv("SYNOCHAT_WEBHOOK_URL", "https://vaultwardendr.duckdns.org/webapi/entry.cgi?api=SYNO.Chat.External&method=incoming&version=2&token=%22rSfkUhV6XtEe87OQFai9IUH0C07KvLBZnctQO8COHiNLoLzSPhwCmUp2rN3pVuIz%22").strip()   # полный URL из Incoming Webhook
+SYNOCHAT_TIMEOUT_SEC   = float(os.getenv("SYNOCHAT_TIMEOUT_SEC", "8"))
+SYNOCHAT_VERIFY_SSL    = os.getenv("SYNOCHAT_VERIFY_SSL", "1").lower() in ("1","true","yes","on")
+SYNOCHAT_INCLUDE_POSTER = os.getenv("SYNOCHAT_INCLUDE_POSTER", "1").lower() in ("1","true","yes","on")
+SYNOCHAT_CA_BUNDLE = os.getenv("SYNOCHAT_CA_BUNDLE", "").strip()  # путь к .pem (опционально)
+SYNOCHAT_RETRIES = int(os.getenv("SYNOCHAT_RETRIES", "3"))
+SYNOCHAT_RETRY_BASE_DELAY = float(os.getenv("SYNOCHAT_RETRY_BASE_DELAY", "0.8"))
+SYNOCHAT_RETRY_BACKOFF = float(os.getenv("SYNOCHAT_RETRY_BACKOFF", "1.7"))
 #выключение контроля добавленного контента
 DISABLE_DEDUP = os.getenv("NOTIFIER_DISABLE_DEDUP", "0").lower() in ("1", "true", "yes")
 #настройки для фильмов
@@ -211,6 +222,16 @@ MVID_POLL_INTERVAL_SEC = int(os.getenv("MVID_POLL_INTERVAL_SEC", "80"))
 MVID_POLL_PAGE_SIZE = int(os.getenv("MVID_POLL_PAGE_SIZE", "500"))
 MVID_POLL_MAX_TOTAL = int(os.getenv("MVID_POLL_MAX_TOTAL", "0"))  # 0 = без ограничения
 MVID_POLL_GRACE_MIN = int(os.getenv("MVID_POLL_GRACE_MIN", "0"))  # 0 — оповещаем сразу кодом
+# --- Outbound proxy for notifications ---
+# Пример: http://user:pass@1.2.3.4:8080  или  socks5h://user:pass@127.0.0.1:1080 или http://192.168.1.34:2088
+NOTIFY_PROXY_URL = os.getenv("NOTIFY_PROXY_URL", "").strip()
+
+# Список хостов/масок, для которых прокси НЕ использовать (через запятую).
+# Поддержка шаблонов: exact, *.domain.tld, localhost.
+NOTIFY_PROXY_NO = [h.strip() for h in os.getenv("NOTIFY_PROXY_NO", "192.168.1.*").split(",") if h.strip()]
+
+# Прогонять ли через прокси локальные/приватные адреса (RFC1918, localhost)
+NOTIFY_PROXY_FOR_INTERNAL = os.getenv("NOTIFY_PROXY_FOR_INTERNAL", "0").lower() in ("1","true","yes","on")
 
 
 # Глобальные переменные
@@ -1544,6 +1565,16 @@ def send_notification(photo_id, caption):
         else:
             logging.warning("Notification failed via Signal")
     # --------------------------
+    # ======= Synology Chat =======
+    try:
+        if SYNOCHAT_ENABLED and SYNOCHAT_WEBHOOK_URL:
+            # plain-текст (Chat не рендерит Markdown как Telegram)
+            caption_plain = clean_markdown_for_apprise(caption or "")
+            file_url = uploaded_url if (SYNOCHAT_INCLUDE_POSTER and uploaded_url) else None
+            send_synology_chat_message(caption_plain, file_url=file_url)
+    except Exception as ex:
+        logging.warning(f"Synology Chat wrapper failed: {ex}")
+    # =============================
 
     # ======= EMAIL: письмо с inline-картинкой из Jellyfin =======
     try:
@@ -5986,6 +6017,207 @@ def send_reddit_link_post_with_comment(title: str, url: str, body_markdown: str 
     except Exception as ex:
         logging.warning(f"Reddit link submit failed: {ex}")
         return False
+
+#Отправка в synology chat
+def _synochat_resp_ok(resp) -> tuple[bool, str]:
+    """Проверяем, что Synology Chat реально принял сообщение."""
+    if resp is None:
+        return False, "no response"
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+    # Попытка разобрать JSON
+    try:
+        j = resp.json()
+        if isinstance(j, dict) and j.get("success") is True:
+            return True, ""
+        # Иногда возвращают {"success":false,"error":{...}}
+        return False, f"API: {j}"
+    except Exception:
+        # Бывают «простые» ответы (редко)
+        t = (resp.text or "").strip()
+        if '"success":true' in t.lower() or t.upper() == "OK":
+            return True, ""
+        return False, f"Body: {t[:200]}"
+
+def _synochat_resp_ok(resp):
+    if resp is None:
+        return False, "no response", None
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}: {resp.text[:200]}", None
+    try:
+        j = resp.json()
+        if isinstance(j, dict):
+            if j.get("success") is True:
+                return True, "", None
+            # иногда: {"success":false,"error":{"code":...,"errors": "..."}}
+            code = (j.get("error") or {}).get("code")
+            return False, f"API: {j}", code
+    except Exception:
+        pass
+    t = (resp.text or "").strip().lower()
+    if '"success":true' in t or t == "ok":
+        return True, "", None
+    return False, f"Body: {resp.text[:200]}", None
+
+
+def send_synology_chat_message(text: str, file_url: str | None = None) -> bool:
+    """
+    Synology Chat Incoming Webhook.
+    1) Не отправляем пустой payload: если text пуст — достраиваем из caption.
+    2) Попытка №1: form (payload=<json>), №2: JSON body.
+    3) Ретраим 117/411/429/5xx.
+    """
+    try:
+        if not (SYNOCHAT_ENABLED and SYNOCHAT_WEBHOOK_URL):
+            return False
+
+        # verify: True / False / CA bundle
+        verify_param = True
+        if not SYNOCHAT_VERIFY_SSL:
+            try:
+                import urllib3
+                from urllib3.exceptions import InsecureRequestWarning
+                urllib3.disable_warnings(InsecureRequestWarning)
+            except Exception:
+                pass
+            verify_param = False
+        elif SYNOCHAT_CA_BUNDLE:
+            verify_param = SYNOCHAT_CA_BUNDLE
+
+        proxies = _notify_proxies_for(SYNOCHAT_WEBHOOK_URL)
+
+        # --- Страховка от пустого текста ---
+        safe_text = (text or "").strip()
+        if not safe_text:
+            # Попробуем извлечь «заголовок + описание» из последнего caption-стиля
+            # (первая жирная строка — header, вторая — title; дальше overview)
+            try:
+                hdr, body = make_jf_inapp_payload_from_caption(text or "")
+                safe_text = (body or hdr or "Notification").strip()
+            except Exception:
+                safe_text = "Notification"
+
+        # Если после этого и poster не включён — не шлём вовсе
+        if not safe_text and not file_url:
+            logging.debug("Synology Chat: empty payload suppressed")
+            return False
+
+        payload = {"text": safe_text}
+        if file_url:
+            payload["file_url"] = file_url
+
+        import time
+        attempts = max(1, SYNOCHAT_RETRIES)
+        delay = max(0.0, SYNOCHAT_RETRY_BASE_DELAY)
+
+        for attempt in range(1, attempts + 1):
+            # --- Попытка №1: form ---
+            r1 = requests.post(
+                SYNOCHAT_WEBHOOK_URL,
+                data={"payload": json.dumps(payload, ensure_ascii=False)},
+                timeout=SYNOCHAT_TIMEOUT_SEC,
+                verify=verify_param,
+                proxies=proxies,
+            )
+            ok, detail, code = _synochat_resp_ok(r1)
+            if ok:
+                logging.info("Synology Chat notification sent")
+                return True
+
+            # --- Попытка №2: JSON body ---
+            r2 = requests.post(
+                SYNOCHAT_WEBHOOK_URL,
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=SYNOCHAT_TIMEOUT_SEC,
+                verify=verify_param,
+                proxies=proxies,
+            )
+            ok2, detail2, code2 = _synochat_resp_ok(r2)
+            if ok2:
+                logging.info("Synology Chat notification sent (json)")
+                return True
+
+            # Решаем, ретраить ли
+            retry_code = code2 if code2 is not None else code
+            # 117 = busy/network; 411 = rate-limit "create post too fast"; 429/5xx уже будут как HTTP в detail
+            should_retry = (retry_code in (117, 411)) or ("HTTP 5" in str(detail) or "HTTP 429" in str(detail2))
+
+            if not should_retry or attempt == attempts:
+                logging.warning(f"Synology Chat failed: {detail} | {detail2}")
+                return False
+
+            logging.warning(f"Synology Chat temporary error (code={retry_code}), retry {attempt}/{attempts}...")
+            time.sleep(delay)
+            delay *= max(1.0, SYNOCHAT_RETRY_BACKOFF)
+
+        return False
+
+    except Exception as ex:
+        logging.warning(f"Synology Chat error: {ex}")
+        return False
+
+#Отправка через прокси
+def _host_matches(pattern: str, host: str) -> bool:
+    p = pattern.lower().strip()
+    h = (host or "").lower().strip()
+    if p == h:
+        return True
+    if p.startswith("*.") and h.endswith(p[1:]):  # *.example.com
+        return True
+    # CIDR: 192.168.1.0/24
+    try:
+        if "/" in p:
+            import ipaddress
+            net = ipaddress.ip_network(p, strict=False)
+            ip = ipaddress.ip_address(h)
+            return ip in net
+    except Exception:
+        pass
+    # Простая маска: 192.168.1.*
+    if p.endswith(".*") and h.startswith(p[:-1]):
+        return True
+    return False
+
+def _is_private_host(host: str) -> bool:
+    """True, если host — приватный IP/localhost/однословный локальный хост."""
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_private or ip.is_loopback or ip.is_link_local
+    except ValueError:
+        # не IP — hostname
+        if host in ("localhost",):
+            return True
+        # однословные имена типа 'nas' обычно локальные
+        if "." not in host:
+            return True
+        # популярные локальные зоны
+        if host.endswith((".local", ".home", ".lan")):
+            return True
+        return False
+
+def _notify_proxies_for(url: str) -> dict | None:
+    """
+    Вернёт dict для requests.proxies или None, если прокси не нужен.
+    """
+    if not NOTIFY_PROXY_URL:
+        return None
+    try:
+        host = urlparse(url).hostname or ""
+    except Exception:
+        host = ""
+
+    # Bypass: приватные/локальные — если не включили форс
+    if not NOTIFY_PROXY_FOR_INTERNAL and _is_private_host(host):
+        return None
+
+    # Bypass: по списку исключений
+    for pat in NOTIFY_PROXY_NO:
+        if _host_matches(pat, host):
+            return None
+
+    return {"http": NOTIFY_PROXY_URL, "https": NOTIFY_PROXY_URL}
+
 
 
 
