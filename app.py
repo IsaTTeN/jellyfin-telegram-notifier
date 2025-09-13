@@ -149,7 +149,7 @@ SYNOCHAT_RETRY_BACKOFF = float(os.getenv("SYNOCHAT_RETRY_BACKOFF", "1.7"))
 DISABLE_DEDUP = os.getenv("NOTIFIER_DISABLE_DEDUP", "0").lower() in ("1", "true", "yes")
 #настройки для фильмов
 MOVIE_POLL_ENABLED = os.getenv("MOVIE_POLL_ENABLED", "1").lower() in ("1", "true", "yes")
-MOVIE_POLL_INTERVAL_SEC = int(os.getenv("MOVIE_POLL_INTERVAL_SEC", "80"))   # каждые 5 минут
+MOVIE_POLL_INTERVAL_SEC = int(os.getenv("MOVIE_POLL_INTERVAL_SEC", "600"))   # каждые 5 минут
 MOVIE_POLL_GRACE_MIN = int(os.getenv("MOVIE_POLL_GRACE_MIN", "45"))  # не трогать фильмы, созданные за последние N минут
 MOVIE_POLL_PAGE_SIZE = int(os.getenv("MOVIE_POLL_PAGE_SIZE", "500"))  # сколько брать за 1 запрос
 MOVIE_POLL_MAX_TOTAL = int(os.getenv("MOVIE_POLL_MAX_TOTAL", "0"))    # 0 = не ограничивать общее число
@@ -170,7 +170,7 @@ INCLUDE_AUDIO_TRACKS = os.getenv("INCLUDE_AUDIO_TRACKS", "1").lower() in ("1", "
 SUPPRESS_WEBHOOK_AFTER_QUALITY_UPDATE_MIN = int(os.getenv("SUPPRESS_WEBHOOK_AFTER_QUALITY_UPDATE_MIN", "60"))  # по умолчанию 60 минут
 # Опрос сериалов (по новым/изменённым эпизодам)
 SERIES_POLL_ENABLED = os.getenv("SERIES_POLL_ENABLED", "1").lower() in ("1","true","yes","on")
-SERIES_POLL_INTERVAL_SEC = int(os.getenv("SERIES_POLL_INTERVAL_SEC", "80"))  # период, сек
+SERIES_POLL_INTERVAL_SEC = int(os.getenv("SERIES_POLL_INTERVAL_SEC", "300"))  # период, сек
 SERIES_POLL_PAGE_SIZE = int(os.getenv("SERIES_POLL_PAGE_SIZE", "500"))
 SERIES_POLL_MAX_TOTAL = int(os.getenv("SERIES_POLL_MAX_TOTAL", "0"))  # 0 = без ограничения
 SERIES_POLL_GRACE_MIN = int(os.getenv("SERIES_POLL_GRACE_MIN", "0"))  # свежие эпизоды отдаём на откуп вебхуку
@@ -196,13 +196,13 @@ WHATSAPP_IMAGE_RETRY_ATTEMPTS = int(os.getenv("WHATSAPP_IMAGE_RETRY_ATTEMPTS", "
 WHATSAPP_IMAGE_RETRY_DELAY_SEC = int(os.getenv("WHATSAPP_IMAGE_RETRY_DELAY_SEC", "2"))
 # --- Episode/Season quality polling (по сериям -> уведомление на сезон) ---
 EP_QUALITY_POLL_ENABLED = (os.getenv("EP_QUALITY_POLL_ENABLED", "1").lower() in ("1","true","yes","on"))
-EP_QUALITY_POLL_INTERVAL_SEC = int(os.getenv("EP_QUALITY_POLL_INTERVAL_SEC", "90"))
+EP_QUALITY_POLL_INTERVAL_SEC = int(os.getenv("EP_QUALITY_POLL_INTERVAL_SEC", "300"))
 EP_QUALITY_POLL_PAGE_SIZE = int(os.getenv("EP_QUALITY_POLL_PAGE_SIZE", "500"))
 EP_QUALITY_POLL_MAX_TOTAL = int(os.getenv("EP_QUALITY_POLL_MAX_TOTAL", "0"))  # 0 = без ограничения
 # Для "свежих" эпизодов можно переиспользовать SERIES_POLL_GRACE_MIN
 # Опрос музыкальных альбомов (по новым/изменённым альбомам)
 ALBUM_POLL_ENABLED = os.getenv("ALBUM_POLL_ENABLED", "1").lower() in ("1","true","yes","on")
-ALBUM_POLL_INTERVAL_SEC = int(os.getenv("ALBUM_POLL_INTERVAL_SEC", "80"))  # период, сек
+ALBUM_POLL_INTERVAL_SEC = int(os.getenv("ALBUM_POLL_INTERVAL_SEC", "300"))  # период, сек
 ALBUM_POLL_PAGE_SIZE = int(os.getenv("ALBUM_POLL_PAGE_SIZE", "500"))
 ALBUM_POLL_MAX_TOTAL = int(os.getenv("ALBUM_POLL_MAX_TOTAL", "0"))  # 0 = без ограничения
 ALBUM_POLL_GRACE_MIN = int(os.getenv("ALBUM_POLL_GRACE_MIN", "0"))  # свежие альбомы отдаём вебхуку (у нас его нет) -> 0
@@ -212,13 +212,13 @@ ALBUM_TRACKLIST_LIMIT = int(os.getenv("ALBUM_TRACKLIST_LIMIT", "5"))  # макс
 ALBUM_TRACKLIST_SHOW_DURATION = os.getenv("ALBUM_TRACKLIST_SHOW_DURATION", "1").lower() in ("1","true","yes","on")
 # --- Books poll ---
 BOOK_POLL_ENABLED = os.getenv("BOOK_POLL_ENABLED", "1").lower() in ("1","true","yes","on")
-BOOK_POLL_INTERVAL_SEC = int(os.getenv("BOOK_POLL_INTERVAL_SEC", "90"))
+BOOK_POLL_INTERVAL_SEC = int(os.getenv("BOOK_POLL_INTERVAL_SEC", "300"))
 BOOK_POLL_PAGE_SIZE = int(os.getenv("BOOK_POLL_PAGE_SIZE", "500"))
 BOOK_POLL_MAX_TOTAL = int(os.getenv("BOOK_POLL_MAX_TOTAL", "0"))  # 0 = без ограничения
 BOOK_POLL_GRACE_MIN = int(os.getenv("BOOK_POLL_GRACE_MIN", "0"))  # 0 — сразу оповещаем кодом
 # --- MusicVideo (клипы) poll ---
 MVID_POLL_ENABLED = os.getenv("MVID_POLL_ENABLED", "1").lower() in ("1","true","yes","on")
-MVID_POLL_INTERVAL_SEC = int(os.getenv("MVID_POLL_INTERVAL_SEC", "80"))
+MVID_POLL_INTERVAL_SEC = int(os.getenv("MVID_POLL_INTERVAL_SEC", "300"))
 MVID_POLL_PAGE_SIZE = int(os.getenv("MVID_POLL_PAGE_SIZE", "500"))
 MVID_POLL_MAX_TOTAL = int(os.getenv("MVID_POLL_MAX_TOTAL", "0"))  # 0 = без ограничения
 MVID_POLL_GRACE_MIN = int(os.getenv("MVID_POLL_GRACE_MIN", "0"))  # 0 — оповещаем сразу кодом
@@ -525,19 +525,19 @@ os.makedirs(os.path.dirname(notified_items_file), exist_ok=True)
 
 # Function to load notified items from the JSON file
 def load_notified_items():
-    # Если файл есть — читаем
-    if os.path.exists(notified_items_file):
-        with open(notified_items_file, 'r', encoding='utf-8') as file:
-            return json.load(file)
-    # Иначе — создаём пустой JSON и возвращаем пустой словарь
-    with open(notified_items_file, 'w', encoding='utf-8') as file:
-        json.dump({}, file, ensure_ascii=False, indent=2)
+    # Если файл есть — читаем, иначе просто возвращаем {}
+    try:
+        if os.path.exists(notified_items_file):
+            with open(notified_items_file, 'r', encoding='utf-8') as file:
+                return json.load(file) or {}
+    except Exception as ex:
+        logging.debug(f"notified_items.json read skipped: {ex}")
     return {}
 
 # Function to save notified items to the JSON file
 def save_notified_items(notified_items_to_save):
-    with open(notified_items_file, 'w', encoding='utf-8') as file:
-        json.dump(notified_items_to_save, file, ensure_ascii=False, indent=2)
+    # Файл больше не используем
+    return
 
 
 notified_items = load_notified_items()
