@@ -187,9 +187,9 @@ SYNOCHAT_RETRY_BACKOFF = float(os.getenv("SYNOCHAT_RETRY_BACKOFF", "1.7"))
 DISABLE_DEDUP = os.getenv("NOTIFIER_DISABLE_DEDUP", "0").lower() in ("1", "true", "yes")
 #настройки для фильмов
 MOVIE_POLL_ENABLED = os.getenv("MOVIE_POLL_ENABLED", "1").lower() in ("1", "true", "yes")
-MOVIE_POLL_INTERVAL_SEC = int(os.getenv("MOVIE_POLL_INTERVAL_SEC", "600"))   # каждые 5 минут
+MOVIE_POLL_INTERVAL_SEC = int(os.getenv("MOVIE_POLL_INTERVAL_SEC", "180"))   # каждые 5 минут
 MOVIE_POLL_GRACE_MIN = int(os.getenv("MOVIE_POLL_GRACE_MIN", "45"))  # не трогать фильмы, созданные за последние N минут
-MOVIE_POLL_PAGE_SIZE = int(os.getenv("MOVIE_POLL_PAGE_SIZE", "500"))  # сколько брать за 1 запрос
+MOVIE_POLL_PAGE_SIZE = int(os.getenv("MOVIE_POLL_PAGE_SIZE", "300"))  # сколько брать за 1 запрос
 MOVIE_POLL_MAX_TOTAL = int(os.getenv("MOVIE_POLL_MAX_TOTAL", "0"))    # 0 = не ограничивать общее число
 # GC БД качества
 QUALITY_GC_ENABLED = os.getenv("QUALITY_GC_ENABLED", "1").lower() in ("1","true","yes","on")
@@ -204,16 +204,16 @@ FORCE_QUALITY_GC_GRACE_DAYS = os.getenv("FORCE_QUALITY_GC_GRACE_DAYS")
 FORCE_QUALITY_GC_VACUUM = os.getenv("FORCE_QUALITY_GC_VACUUM", "0").lower() in ("1","true","yes","on")
 #выключить отправку информации о звуковых дорожках
 INCLUDE_AUDIO_TRACKS = os.getenv("INCLUDE_AUDIO_TRACKS", "1").lower() in ("1", "true", "yes", "on")
-#подавление дублирующих сообщение webhook если это былдо обновление контента
+#подавление дублирующих сообщение webhook если это было обновление контента
 SUPPRESS_WEBHOOK_AFTER_QUALITY_UPDATE_MIN = int(os.getenv("SUPPRESS_WEBHOOK_AFTER_QUALITY_UPDATE_MIN", "60"))  # по умолчанию 60 минут
 # Опрос сериалов (по новым/изменённым эпизодам)
 SERIES_POLL_ENABLED = os.getenv("SERIES_POLL_ENABLED", "1").lower() in ("1","true","yes","on")
-SERIES_POLL_INTERVAL_SEC = int(os.getenv("SERIES_POLL_INTERVAL_SEC", "300"))  # период, сек
-SERIES_POLL_PAGE_SIZE = int(os.getenv("SERIES_POLL_PAGE_SIZE", "500"))
+SERIES_POLL_INTERVAL_SEC = int(os.getenv("SERIES_POLL_INTERVAL_SEC", "120"))  # период, сек
+SERIES_POLL_PAGE_SIZE = int(os.getenv("SERIES_POLL_PAGE_SIZE", "300"))
 SERIES_POLL_MAX_TOTAL = int(os.getenv("SERIES_POLL_MAX_TOTAL", "0"))  # 0 = без ограничения
 SERIES_POLL_GRACE_MIN = int(os.getenv("SERIES_POLL_GRACE_MIN", "0"))  # свежие эпизоды отдаём на откуп вебхуку
 # Посылать ли уведомление при ПЕРВОМ обнаружении сезона (по умолчанию нет)
-SERIES_POLL_INITIAL_ANNOUNCE = os.getenv("SERIES_POLL_INITIAL_ANNOUNCE", "0").lower() in ("1","true","yes","on")
+SERIES_POLL_INITIAL_ANNOUNCE = os.getenv("SERIES_POLL_INITIAL_ANNOUNCE", "1").lower() in ("1","true","yes","on")
 # Блокировать таймеры отправки на время сканирования библиотеки Jellyfin
 NOTIFY_BLOCK_DURING_SCAN = os.getenv("NOTIFY_BLOCK_DURING_SCAN", "1").lower() in ("1","true","yes","on")
 SCAN_RECHECK_DELAY_SEC = int(os.getenv("SCAN_RECHECK_DELAY_SEC", "5"))   # пауза между проверками
@@ -234,8 +234,8 @@ WHATSAPP_IMAGE_RETRY_ATTEMPTS = int(os.getenv("WHATSAPP_IMAGE_RETRY_ATTEMPTS", "
 WHATSAPP_IMAGE_RETRY_DELAY_SEC = int(os.getenv("WHATSAPP_IMAGE_RETRY_DELAY_SEC", "2"))
 # --- Episode/Season quality polling (по сериям -> уведомление на сезон) ---
 EP_QUALITY_POLL_ENABLED = (os.getenv("EP_QUALITY_POLL_ENABLED", "1").lower() in ("1","true","yes","on"))
-EP_QUALITY_POLL_INTERVAL_SEC = int(os.getenv("EP_QUALITY_POLL_INTERVAL_SEC", "300"))
-EP_QUALITY_POLL_PAGE_SIZE = int(os.getenv("EP_QUALITY_POLL_PAGE_SIZE", "500"))
+EP_QUALITY_POLL_INTERVAL_SEC = int(os.getenv("EP_QUALITY_POLL_INTERVAL_SEC", "240"))
+EP_QUALITY_POLL_PAGE_SIZE = int(os.getenv("EP_QUALITY_POLL_PAGE_SIZE", "300"))
 EP_QUALITY_POLL_MAX_TOTAL = int(os.getenv("EP_QUALITY_POLL_MAX_TOTAL", "0"))  # 0 = без ограничения
 # Для "свежих" эпизодов можно переиспользовать SERIES_POLL_GRACE_MIN
 # Опрос музыкальных альбомов (по новым/изменённым альбомам)
@@ -271,7 +271,13 @@ NOTIFY_PROXY_NO = [h.strip() for h in os.getenv("NOTIFY_PROXY_NO", "192.168.1.*"
 # Прогонять ли через прокси локальные/приватные адреса (RFC1918, localhost)
 NOTIFY_PROXY_FOR_INTERNAL = os.getenv("NOTIFY_PROXY_FOR_INTERNAL", "0").lower() in ("1","true","yes","on")
 
+# --- Incremental polling (high-watermark) helpers ---
+POLL_BACKFILL_MIN = int(os.getenv("POLL_BACKFILL_MIN", "15"))
 
+SERIES_LIBRARY_IDS = os.getenv("SERIES_LIBRARY_IDS", "")  # "libId1,libId2"
+TV_PARENT_IDS = [s.strip() for s in SERIES_LIBRARY_IDS.split(",") if s.strip()]
+# Вебхука больше нет — всё делает пуллер
+USE_WEBHOOK = os.getenv("USE_WEBHOOK", "0").lower() in ("1","true","yes","on")
 # Глобальные переменные
 imgbb_upload_done = threading.Event()   # Сигнал о завершении загрузки
 uploaded_image_url = None               # Здесь хранится ссылка после удачной загрузки
@@ -557,6 +563,55 @@ def _init_quality_db():
         conn.close()
 
 _init_quality_db()
+
+# Пробуем облегчить запросы
+def _iso_utc_now_z(dt=None) -> str:
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+    return dt.isoformat(timespec='seconds').replace('+00:00','Z')
+
+def _poll_since_get(key: str) -> str:
+    """
+    Берём сохранённый watermark. Если ещё не было — сеем текущим временем минус POLL_BACKFILL_MIN (мин).
+    """
+    iso = _meta_get(key)
+    if iso:
+        return iso
+    seeded = _iso_utc_now_z(datetime.now(timezone.utc) - timedelta(minutes=max(POLL_BACKFILL_MIN, 1)))
+    _meta_set(key, seeded)
+    return seeded
+
+def _poll_since_bump(key: str, now_utc: datetime | None = None):
+    _meta_set(key, _iso_utc_now_z(now_utc))
+#Оповещение о готовноасти базы данных
+def _meta_get(key: str) -> str | None:
+    try:
+        conn = sqlite3.connect(QUALITY_DB_FILE, timeout=10)
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM app_meta WHERE key=?", (key,))
+        row = cur.fetchone()
+        return row[0] if row else None
+    except Exception as ex:
+        logging.debug(f"_meta_get({key}) failed: {ex}")
+        return None
+    finally:
+        try: conn.close()
+        except: pass
+
+def _meta_set(key: str, value: str):
+    try:
+        conn = sqlite3.connect(QUALITY_DB_FILE, timeout=10)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO app_meta(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """, (key, value))
+        conn.commit()
+    except Exception as ex:
+        logging.debug(f"_meta_set({key}) failed: {ex}")
+    finally:
+        try: conn.close()
+        except: pass
 
 # Убедимся, что папка /app/data существует
 os.makedirs(os.path.dirname(notified_items_file), exist_ok=True)
@@ -2363,6 +2418,74 @@ def send_whatsapp_image_with_retries(
             time.sleep(delay)
     return False
 
+def jellyfin_list_recent_episodes_for_series(series_id: str, *, limit: int = 50) -> list[dict]:
+    """
+    Возвращает до `limit` самых свежих эпизодов конкретного сериала.
+    Поля минимальные: SeasonId/ParentId, DateCreated.
+    """
+    try:
+        params = {
+            "api_key": JELLYFIN_API_KEY,
+            "Fields": "DateCreated,ParentId,SeasonId,ProductionYear",
+            "IsMissing": "false",
+            "IsUnaired": "false",
+            "IsVirtualUnaired": "false",
+            "LocationTypes": "FileSystem",
+            "SortBy": "DateCreated",
+            "SortOrder": "Descending",
+            "Limit": str(max(limit, 1)),
+            # На этом эндпоинте тоже допустим, и снижает нагрузку на подсчёте:
+            "EnableTotalRecordCount": "false",
+        }
+        url = f"{JELLYFIN_BASE_URL}/emby/Shows/{series_id}/Episodes"
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json() or {}
+        return data.get("Items") or []
+    except Exception as ex:
+        logging.warning(f"list_recent_episodes_for_series({series_id}) failed: {ex}")
+        return []
+
+def build_season_announce_message(*, series_name_cleaned: str, season_name: str,
+                                  release_year, overview_to_use: str,
+                                  present: int, total: int,
+                                  tmdb_id: str | None, trailer_url: str | None,
+                                  season_id: str) -> str:
+    msg = f"*{t('new_season_title')}*\n\n*{series_name_cleaned}* *({release_year})*\n\n*{season_name}*"
+    if total and present >= 0:
+        msg += f"\n\n{t('season_added_progress').format(added=present, total=total)}"
+    elif present > 0:
+        msg += f"\n\n{t('season_added_count_only').format(added=present)}"
+    if overview_to_use:
+        msg += f"\n\n{overview_to_use}"
+
+    # рейтинги TMDB/mdblist
+    if tmdb_id:
+        ratings_text = safe_fetch_mdblist_ratings("show", tmdb_id)
+        if ratings_text:
+            msg += f"\n\n*{t('new_ratings_show')}*\n{ratings_text}"
+
+    # трейлер
+    if trailer_url:
+        msg += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
+
+    # блок «разрешение» (best-effort)
+    try:
+        res_label = _season_resolution_label(season_id)
+        if res_label:
+            L = _labels()
+            msg += f"\n\n*{L['resolution']}*\n{res_label}"
+    except Exception as ex:
+        logging.debug(f"(Season) resolution block failed for {season_id}: {ex}")
+
+    # аудиодорожки (по флагу)
+    if INCLUDE_AUDIO_TRACKS:
+        tracks_block = build_audio_tracks_block_for_season(season_id)
+        if tracks_block:
+            msg += tracks_block
+
+    return msg
+
 
 def get_item_details(item_id):
     headers = {'accept': 'application/json', }
@@ -3005,6 +3128,7 @@ def poll_recent_movies_once():
                 break
 
         try:
+            since_iso = _poll_since_get("movie_poll_since")  # NEW
             params = {
                 "api_key": JELLYFIN_API_KEY,
                 "IncludeItemTypes": "Movie",
@@ -3014,7 +3138,10 @@ def poll_recent_movies_once():
                 "Limit": str(current_limit),
                 "StartIndex": str(start),
                 # DateCreated нужен для грейс-фильтра (чтобы вебхук объявлял «новые»)
-                "Fields": "MediaSources,RunTimeTicks,ProviderIds,ProductionYear,Overview,DateCreated"
+                "Fields": "RunTimeTicks,ProviderIds,ProductionYear,Overview,DateCreated",
+                # NEW: инкрементальный фильтр
+                "MinDateLastSaved": since_iso,
+                "EnableTotalRecordCount": "false",
             }
             url = f"{JELLYFIN_BASE_URL}/emby/Items"
             r = requests.get(url, params=params, timeout=20)
@@ -3188,6 +3315,8 @@ def poll_recent_movies_once():
     # ... в самом конце функции:
     _meta_set('touched_movies','1')
     _maybe_send_onboarding_congrats()
+
+    _poll_since_bump("movie_poll_since", now_utc)
 
 def _detect_image_profiles_from_fields(s: dict) -> list[str]:
     """
@@ -3839,217 +3968,256 @@ def jellyfin_get_season_counts_resilient(season_id: str) -> tuple[int, int] | tu
 
     return (present, total)
 
+def _iter_changed_series_ids(since_iso: str | None, *, start: int, limit: int) -> list[str]:
+    """
+    Фаза 1: возвращает список Series-IDs, которые могли измениться после since_iso.
+    Делает лёгкий запрос к /emby/Items (Series) и фильтрует по DateLastMediaAdded/DateModified на клиенте,
+    если сервер падает на minDateLastSaved.
+    """
+    base_params = {
+        "api_key": JELLYFIN_API_KEY,
+        "IncludeItemTypes": "Series",
+        "Recursive": "true",
+        "SortBy": "DateModified,DateCreated",
+        "SortOrder": "Descending",
+        "Limit": str(limit),
+        "StartIndex": str(start),
+        "Fields": "DateLastMediaAdded,DateLastSaved",
+        "EnableTotalRecordCount": "false",
+    }
+
+    def _fetch_once(params: dict) -> list[dict]:
+        url = f"{JELLYFIN_BASE_URL}/emby/Items"
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        payload = r.json() or {}
+        return payload.get("Items") or []
+
+    # обходим несколько ParentId (если заданы), иначе один проход без ParentId
+    parents = TV_PARENT_IDS if globals().get("TV_PARENT_IDS") else [None]
+
+    out_ids: list[str] = []
+    since_dt = _parse_iso_utc(since_iso) if since_iso else None
+
+    for parent in parents:
+        params = dict(base_params)
+        if parent:
+            params["ParentId"] = parent
+
+        # пробуем с minDateLastSaved (нижний регистр!)
+        if since_iso:
+            params["minDateLastSaved"] = since_iso  # см. офиц. список параметров ItemsApiGetItemsRequest :contentReference[oaicite:4]{index=4}
+
+        try:
+            items = _fetch_once(params)
+        except requests.HTTPError as ex:
+            # Если 5xx — повторяем без minDateLastSaved
+            if getattr(getattr(ex, "response", None), "status_code", 0) >= 500:
+                params.pop("minDateLastSaved", None)
+                items = _fetch_once(params)
+            else:
+                raise
+
+        for it in items:
+            sid = it.get("Id")
+            if not sid:
+                continue
+            # Клиентский отсев по времени
+            if since_dt:
+                d = it.get("DateLastMediaAdded") or it.get("DateLastSaved") or it.get("DateModified") or it.get("DateCreated")
+                dt = _parse_iso_utc(d)
+                if dt and dt < since_dt:
+                    continue
+            out_ids.append(sid)
+
+    # убираем дубли, сохраняем порядок
+    seen = set()
+    uniq = []
+    for sid in out_ids:
+        if sid not in seen:
+            uniq.append(sid); seen.add(sid)
+    return uniq
+
+def _fetch_recent_episodes_for_series(series_id: str, *, limit: int = 60) -> list[dict]:
+    """
+    Возвращает свежие эпизоды одного сериала (последние N), отсортированные по дате.
+    Используем /emby/Items с ParentId=series_id (быстрее и стабильнее).
+    """
+    params = {
+        "api_key": JELLYFIN_API_KEY,
+        "ParentId": series_id,
+        "IncludeItemTypes": "Episode",
+        "Recursive": "true",
+        "SortBy": "DateCreated,DateModified",
+        "SortOrder": "Descending",
+        "Limit": str(limit),
+        "StartIndex": "0",
+        "Fields": "ParentId,SeriesId,SeasonName,DateCreated,ProductionYear,Overview",
+        "EnableTotalRecordCount": "false",
+    }
+    url = f"{JELLYFIN_BASE_URL}/emby/Items"
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    return (r.json() or {}).get("Items") or []
+
+
 def poll_recent_episodes_once():
     """
-    Ищем свежие эпизоды постранично, группируем по сезону и шлём ОДНО уведомление «Новый сезон: добавлено N из M».
-    Свежие (моложе SERIES_POLL_GRACE_MIN) пропускаем — пусть их анонсирует вебхук.
+    Фаза 1: ищем изменённые сериалы (быстро и дёшево для API).
+    Фаза 2: по каждому сериалу вытягиваем последние эпизоды, группируем по сезону и шлём ОДНО уведомление
+            «Новый сезон: добавлено N из M». Совсем свежие (грейс) пропускаем — их объявит вебхук.
     """
     page_size = SERIES_POLL_PAGE_SIZE
-    max_total = SERIES_POLL_MAX_TOTAL or 0  # 0 = без ограничения
+    max_total = SERIES_POLL_MAX_TOTAL or 0
     start = 0
     fetched = 0
     now_utc = datetime.now(timezone.utc)
+    since_iso = _poll_since_get("series_poll_since")  # есть в файле :contentReference[oaicite:6]{index=6}
 
     processed_seasons: set[str] = set()
+    since_dt = _parse_iso_utc(since_iso) if since_iso else None
 
     while True:
-        # ограничим последнюю страницу при max_total
         current_limit = page_size if (not max_total or (max_total - fetched) >= page_size) else (max_total - fetched)
         if current_limit <= 0:
             break
 
         try:
-            params = {
-                "api_key": JELLYFIN_API_KEY,
-                "IncludeItemTypes": "Episode",
-                "Recursive": "true",
-                "SortBy": "DateCreated,DateModified",
-                "SortOrder": "Descending",
-                "Limit": str(current_limit),
-                "StartIndex": str(start),
-                "Fields": "ParentId,SeriesId,SeasonName,DateCreated,ProductionYear,Overview"
-            }
-            url = f"{JELLYFIN_BASE_URL}/emby/Items"
-            r = requests.get(url, params=params, timeout=20)
-            r.raise_for_status()
-            payload = r.json() or {}
-            items = payload.get("Items") or []
+            series_ids = _iter_changed_series_ids(since_iso, start=start, limit=current_limit)
         except Exception as ex:
-            logging.warning(f"Series poll: failed page start={start}: {ex}")
+            logging.warning(f"Series poll (phase-1 series) failed start={start}: {ex}")
             break
 
-        if not items:
+        if not series_ids:
             break
 
-        # сгруппируем эпизоды по сезону
-        for ep in items:
+        for series_id in series_ids:
             try:
-                season_id = ep.get("ParentId") or ep.get("SeasonId")
-                if not season_id or season_id in processed_seasons:
-                    continue
-
-                # грейс: если эпизод совсем свежий — пропускаем сезон, пусть вебхук объявит
-                created_iso = ep.get("DateCreated")
-                created_dt = _parse_iso_utc(created_iso) if ' _parse_iso_utc' in globals() else None
-                if created_dt and (now_utc - created_dt) < timedelta(minutes=SERIES_POLL_GRACE_MIN):
-                    logging.debug(f"Series poll: skip fresh season (ep created {created_dt.isoformat()}) season={season_id}")
-                    continue
-
-                # получаем детали сезона/сериала
-                season_details = get_item_details(season_id)
-                s_item = (season_details.get("Items") or [{}])[0]
-                series_id = s_item.get("SeriesId")
-                season_name = s_item.get("Name") or ep.get("SeasonName") or "Season"
-                release_year = s_item.get("ProductionYear") or ep.get("ProductionYear")
-
-                series_details = get_item_details(series_id) if series_id else {"Items": [{}]}
-                series_item = (series_details.get("Items") or [{}])[0]
-                series_name = series_item.get("Name") or ""
-                overview_to_use = s_item.get("Overview") or series_item.get("Overview") or ""
-
-                # антиспам-ключ, как в вебхуке
-                series_name_cleaned = series_name.replace(f" ({release_year})", "").strip()
-                key_name = f"{series_name_cleaned} {season_name}".strip()
-
-                if item_already_notified("Season", key_name, release_year):
-                    processed_seasons.add(season_id)
-                    continue
-
-                # считаем «сколько есть / сколько всего» по сезону (используй твой resilient-хелпер)
-                # в poll_recent_episodes_once(), прямо перед подсчётом present/total:
-                wait_until_scan_idle("season counts build")
-                present, total = jellyfin_get_season_counts_resilient(season_id)
-                # сезон удалён — пропускаем
-                if isinstance(present, int) and isinstance(total, int) and present == -1 and total == -1:
-                    processed_seasons.add(season_id)
-                    continue
-
-                # --- Срез по дате создания БД: baseline только ОДИН РАЗ, если сезона ещё нет в БД ---
-                row_existing = _sp_get(season_id)
-                if row_existing is None:
-                    try:
-                        db_created_iso = _db_get_created_at_iso()
-                        db_created_dt = _parse_iso_dt(db_created_iso)
-
-                        # DateCreated у сезона берём из уже полученного s_item; если вдруг нет — дёрнем детали
-                        season_created_iso = s_item.get("DateCreated")
-                        if not season_created_iso:
-                            s_det_fallback = get_item_details(season_id)
-                            season_created_iso = ((s_det_fallback.get("Items") or [{}])[0]).get("DateCreated")
-                        season_created_dt = _parse_iso_dt(season_created_iso)
-
-                        if db_created_dt and season_created_dt and (season_created_dt < db_created_dt):
-                            # Сезон был ДО создания БД — пишем baseline и НЕ шлём уведомление
-                            _sp_upsert(
-                                season_id,
-                                present=present, total=total,
-                                series_id=series_id,
-                                season_number=int(s_item.get("IndexNumber")) if s_item.get(
-                                    "IndexNumber") is not None else None,
-                                series_name=series_name_cleaned,
-                                release_year=release_year,
-                                mark_notified=True  # baseline: сразу считаем «объявленным»
-                            )
-                            logging.info(
-                                f"(Series poll) Season pre-DB cutoff baseline: {series_name_cleaned} {season_name} — {present}/{total}")
-                            processed_seasons.add(season_id)
-                            continue
-                    except Exception as ex:
-                        logging.warning(f"Season cutoff check failed for {season_id}: {ex}")
-                # --- конец среза ---
-
-                # 1) сохраняем «наблюдение» (без mark_notified) — чтобы иметь базу для следующего раза
-                _sp_upsert(
-                    season_id,
-                    present=present, total=total,
-                    series_id=series_id,
-                    season_number=int(s_item.get("IndexNumber")) if s_item.get("IndexNumber") is not None else None,
-                    series_name=series_name_cleaned,
-                    release_year=release_year,
-                    mark_notified=False
-                )
-
-                # 2) решаем, отправлять ли: только если present вырос со времени прошлого уведомления
-                if not _sp_should_notify(season_id, present):
-                    processed_seasons.add(season_id)
-                    continue
-                # мы решили отправлять: сразу «закрываем» сезон на этот прогон,
-                # чтобы следующие эпизоды не повторяли внешние вызовы
-                processed_seasons.add(season_id)
-
-                # рейтинги/трейлер (опционально)
-                tmdb_id = jellyfin_get_tmdb_id(series_id) if 'jellyfin_get_tmdb_id' in globals() else None
-                trailer_url = safe_get_trailer_prefer_tmdb(f"{series_name_cleaned} Trailer {release_year}",
-                                subkind="show", tmdb_id=tmdb_id, context="")
-
-                # 3) формируем сообщение
-                notification_message = (
-                    f"*{t('new_season_title')}*\n\n*{series_name_cleaned}* *({release_year})*\n\n"
-                    f"*{season_name}*"
-                )
-                if total >= present and total > 0:
-                    notification_message += f"\n\n{t('season_added_progress').format(added=present, total=total)}"
-                elif present > 0:
-                    notification_message += f"\n\n{t('season_added_count_only').format(added=present)}"
-                if overview_to_use:
-                    notification_message += f"\n\n{overview_to_use}"
-                if tmdb_id:
-                    ratings_text = safe_fetch_mdblist_ratings("show", tmdb_id)
-                    if ratings_text:
-                        notification_message += f"\n\n*{t('new_ratings_show')}*\n{ratings_text}"
-                if trailer_url:
-                    notification_message += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
-
-                # ↓↓↓ добавить это здесь
-                try:
-                    res_label = _season_resolution_label(season_id)
-                    if res_label:
-                        L = _labels()
-                        notification_message += f"\n\n*{L['resolution']}*\n{res_label}"
-                except Exception as ex:
-                    logging.debug(f"(Season) resolution block failed for {season_id}: {ex}")
-
-                if INCLUDE_AUDIO_TRACKS:
-                    tracks_block = build_audio_tracks_block_for_season(season_id)
-                    if tracks_block:
-                        notification_message += tracks_block
-
-                # 4) отправляем и фиксируем «до куда сообщили»
-                if _fetch_jellyfin_image_with_retries(season_id, attempts=1, timeout=3):
-                    send_notification(season_id, notification_message)
-                else:
-                    send_notification(series_id, notification_message)
-                    logging.warning(
-                        f"(Series poll) {series_name_cleaned} {season_name} image missing; using series image")
-
-                # помечаем прогресс: теперь last_notified_present = present
-                _sp_upsert(
-                    season_id,
-                    present=present, total=total,
-                    series_id=series_id,
-                    season_number=int(s_item.get("IndexNumber")) if s_item.get("IndexNumber") is not None else None,
-                    series_name=series_name_cleaned,
-                    release_year=release_year,
-                    mark_notified=True
-                )
-
-                logging.info(
-                    f"(Series poll) Season announced: {series_name_cleaned} {season_name} — {present} / {total}")
-                processed_seasons.add(season_id)
-
+                eps = _fetch_recent_episodes_for_series(series_id, limit=max(int(os.getenv("SERIES_SERIES_EP_FETCH_LIMIT", "60")), 20))
             except Exception as ex:
-                logging.warning(f"Series poll: season from ep {ep.get('Id')} failed: {ex}")
+                logging.warning(f"Series poll: episodes fetch failed for series {series_id}: {ex}")
+                continue
 
-        n = len(items)
-        fetched += n
-        start += n
-        logging.debug(f"Series poll: page fetched {n} episodes (total {fetched})")
-        if n < current_limit:
-            break  # последняя страница
+            # фильтруем только те эпизоды, которые не моложе since (и не моложе грейса)
+            for ep in eps:
+                try:
+                    created_dt = _parse_iso_utc(ep.get("DateCreated"))
+                    if since_dt and created_dt and created_dt < since_dt:
+                        continue
+                    if created_dt and (now_utc - created_dt) < timedelta(minutes=SERIES_POLL_GRACE_MIN):
+                        # пусть вебхук объявляет «совсем свежие»
+                        continue
 
-    # <<< ДОБАВИТЬ ВОТ ЗДЕСЬ (указать тот же отступ, что и у while) >>>
+                    season_id = ep.get("ParentId") or ep.get("SeasonId")
+                    if not season_id or season_id in processed_seasons:
+                        continue
+
+                    # детали сезона/сериала
+                    season_details = get_item_details(season_id)
+                    s_item = (season_details.get("Items") or [{}])[0]
+                    series_id2 = s_item.get("SeriesId") or series_id
+                    season_name = s_item.get("Name") or ep.get("SeasonName") or "Season"
+                    release_year = s_item.get("ProductionYear") or ep.get("ProductionYear")
+
+                    series_details = get_item_details(series_id2) if series_id2 else {"Items": [{}]}
+                    series_item = (series_details.get("Items") or [{}])[0]
+                    series_name = series_item.get("Name") or ""
+                    overview_to_use = s_item.get("Overview") or series_item.get("Overview") or ""
+
+                    # антиспам-ключ, как в вебхуке
+                    series_name_cleaned = series_name.replace(f" ({release_year})", "").strip()
+                    key_name = f"{series_name_cleaned} {season_name}".strip()
+
+                    # Раньше тут был ранний continue, который блокировал прогресс-апдейты
+                    # (если сезон уже объявлялся через webhook). Теперь НЕ прерываемся:
+                    # просто пройдём дальше и решим через _sp_should_notify(), вырос ли present.
+                    if item_already_notified("Season", key_name, release_year):
+                        logging.debug(
+                            f"Series poll: {key_name} was announced earlier; checking for progress bump via _sp_should_notify.")
+
+                    # считаем «сколько есть / сколько всего»
+                    wait_until_scan_idle("season counts build")
+                    present, total = jellyfin_get_season_counts_resilient(season_id)
+
+                    # сезон удалён — пропускаем
+                    if isinstance(present, int) and isinstance(total, int) and present == -1 and total == -1:
+                        processed_seasons.add(season_id)
+                        continue
+
+                    # baseline: если сезон старше даты создания БД — пометить и не слать
+                    row_existing = _sp_get(season_id)
+                    if row_existing is None:
+                        try:
+                            db_created_iso = _db_get_created_at_iso()
+                            db_created_dt = _parse_iso_dt(db_created_iso)
+                            season_created_iso = s_item.get("DateCreated") or ((get_item_details(season_id).get("Items") or [{}])[0]).get("DateCreated")
+                            season_created_dt = _parse_iso_dt(season_created_iso)
+                            if db_created_dt and season_created_dt and (season_created_dt < db_created_dt):
+                                _sp_upsert(
+                                    season_id,
+                                    present=present, total=total,
+                                    series_id=series_id2,
+                                    season_number=int(s_item.get("IndexNumber")) if s_item.get("IndexNumber") is not None else None,
+                                    series_name=series_name_cleaned,
+                                    release_year=release_year,
+                                    mark_notified=True
+                                )
+                                logging.info(f"(Series poll) Season pre-DB cutoff baseline: {series_name_cleaned} {season_name} — {present}/{total}")
+                                processed_seasons.add(season_id)
+                                continue
+                        except Exception as ex:
+                            logging.debug(f"Series poll baseline check failed for {season_id}: {ex}")
+
+                    # текст и отправка
+                    tmdb_id = jellyfin_get_tmdb_id(series_id2)
+                    trailer_url = safe_get_trailer_prefer_tmdb(
+                        f"{series_name_cleaned} Trailer {release_year}",
+                        subkind="show",
+                        tmdb_id=tmdb_id,
+                        context=""
+                    )
+                    notification_message = build_season_announce_message(
+                        series_name_cleaned=series_name_cleaned,
+                        season_name=season_name,
+                        release_year=release_year,
+                        overview_to_use=overview_to_use,
+                        present=present, total=total,
+                        tmdb_id=tmdb_id, trailer_url=trailer_url,
+                        season_id=season_id
+                    )
+
+                    if _fetch_jellyfin_image_with_retries(season_id, attempts=1, timeout=3):
+                        send_notification(season_id, notification_message)
+                    else:
+                        send_notification(series_id2, notification_message)
+                        logging.warning(f"(Series poll) {series_name_cleaned} {season_name} image missing; using series image")
+
+                    _sp_upsert(
+                        season_id,
+                        present=present, total=total,
+                        series_id=series_id2,
+                        season_number=int(s_item.get("IndexNumber")) if s_item.get("IndexNumber") is not None else None,
+                        series_name=series_name_cleaned,
+                        release_year=release_year,
+                        mark_notified=True
+                    )
+                    logging.info(f"(Series poll) Season announced: {series_name_cleaned} {season_name} — {present} / {total}")
+                    processed_seasons.add(season_id)
+
+                except Exception as ex:
+                    logging.warning(f"Series poll: season from ep {ep.get('Id')} failed: {ex}")
+
+        # пагинация по сериалам
+        fetched += len(series_ids)
+        start += len(series_ids)
+        if len(series_ids) < current_limit:
+            break
+
     _meta_set('touched_series', '1')
     _maybe_send_onboarding_congrats()
+    _poll_since_bump("series_poll_since", now_utc)
+
+
 
 def _series_poll_loop():
     while True:
@@ -4946,6 +5114,7 @@ def poll_episode_quality_once():
         if current_limit <= 0:
             break
         try:
+            since_iso = _poll_since_get("epq_poll_since")  # NEW
             params = {
                 "api_key": JELLYFIN_API_KEY,
                 "IncludeItemTypes": "Episode",
@@ -4954,7 +5123,8 @@ def poll_episode_quality_once():
                 "SortOrder": "Descending",
                 "Limit": str(current_limit),
                 "StartIndex": str(start),
-                "Fields": "ParentId,DateCreated"
+                "Fields": "ParentId,DateCreated",
+                "EnableTotalRecordCount": "false",
             }
             url = f"{JELLYFIN_BASE_URL}/emby/Items"
             r = requests.get(url, params=params, timeout=20)
@@ -4995,6 +5165,9 @@ def poll_episode_quality_once():
     global _last_epq_since
 #    logging.info(f"(EpQuality poll) processed={len(processed_seasons)}, triggered={triggered}, since={_last_epq_since.isoformat()}")
     _last_epq_since = now_utc
+
+    _poll_since_bump("epq_poll_since", now_utc)
+
 
 def _ep_quality_poll_loop():
     while True:
@@ -5780,35 +5953,7 @@ if MVID_POLL_ENABLED:
     logging.info(f"MusicVideo polling enabled every {MVID_POLL_INTERVAL_SEC}s "
                  f"(page={MVID_POLL_PAGE_SIZE}, max_total={MVID_POLL_MAX_TOTAL}, grace={MVID_POLL_GRACE_MIN}m)")
 
-#Оповещение о готовноасти базы данных
-def _meta_get(key: str) -> str | None:
-    try:
-        conn = sqlite3.connect(QUALITY_DB_FILE, timeout=10)
-        cur = conn.cursor()
-        cur.execute("SELECT value FROM app_meta WHERE key=?", (key,))
-        row = cur.fetchone()
-        return row[0] if row else None
-    except Exception as ex:
-        logging.debug(f"_meta_get({key}) failed: {ex}")
-        return None
-    finally:
-        try: conn.close()
-        except: pass
 
-def _meta_set(key: str, value: str):
-    try:
-        conn = sqlite3.connect(QUALITY_DB_FILE, timeout=10)
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO app_meta(key, value) VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value=excluded.value
-        """, (key, value))
-        conn.commit()
-    except Exception as ex:
-        logging.debug(f"_meta_set({key}) failed: {ex}")
-    finally:
-        try: conn.close()
-        except: pass
 
 def _maybe_send_onboarding_congrats():
     try:
@@ -6255,8 +6400,6 @@ def _notify_proxies_for(url: str) -> dict | None:
             return None
 
     return {"http": NOTIFY_PROXY_URL, "https": NOTIFY_PROXY_URL}
-
-
 
 
 
