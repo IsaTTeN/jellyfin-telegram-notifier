@@ -187,9 +187,9 @@ SYNOCHAT_RETRY_BACKOFF = float(os.getenv("SYNOCHAT_RETRY_BACKOFF", "1.7"))
 DISABLE_DEDUP = os.getenv("NOTIFIER_DISABLE_DEDUP", "0").lower() in ("1", "true", "yes")
 #настройки для фильмов
 MOVIE_POLL_ENABLED = os.getenv("MOVIE_POLL_ENABLED", "1").lower() in ("1", "true", "yes")
-MOVIE_POLL_INTERVAL_SEC = int(os.getenv("MOVIE_POLL_INTERVAL_SEC", "180"))   # каждые 5 минут
+MOVIE_POLL_INTERVAL_SEC = int(os.getenv("MOVIE_POLL_INTERVAL_SEC", "120"))   # каждые 5 минут
 MOVIE_POLL_GRACE_MIN = int(os.getenv("MOVIE_POLL_GRACE_MIN", "45"))  # не трогать фильмы, созданные за последние N минут
-MOVIE_POLL_PAGE_SIZE = int(os.getenv("MOVIE_POLL_PAGE_SIZE", "300"))  # сколько брать за 1 запрос
+MOVIE_POLL_PAGE_SIZE = int(os.getenv("MOVIE_POLL_PAGE_SIZE", "2000"))  # сколько брать за 1 запрос
 MOVIE_POLL_MAX_TOTAL = int(os.getenv("MOVIE_POLL_MAX_TOTAL", "0"))    # 0 = не ограничивать общее число
 # GC БД качества
 QUALITY_GC_ENABLED = os.getenv("QUALITY_GC_ENABLED", "1").lower() in ("1","true","yes","on")
@@ -209,15 +209,15 @@ SUPPRESS_WEBHOOK_AFTER_QUALITY_UPDATE_MIN = int(os.getenv("SUPPRESS_WEBHOOK_AFTE
 # Опрос сериалов (по новым/изменённым эпизодам)
 SERIES_POLL_ENABLED = os.getenv("SERIES_POLL_ENABLED", "1").lower() in ("1","true","yes","on")
 SERIES_POLL_INTERVAL_SEC = int(os.getenv("SERIES_POLL_INTERVAL_SEC", "120"))  # период, сек
-SERIES_POLL_PAGE_SIZE = int(os.getenv("SERIES_POLL_PAGE_SIZE", "300"))
+SERIES_POLL_PAGE_SIZE = int(os.getenv("SERIES_POLL_PAGE_SIZE", "2000"))
 SERIES_POLL_MAX_TOTAL = int(os.getenv("SERIES_POLL_MAX_TOTAL", "0"))  # 0 = без ограничения
 SERIES_POLL_GRACE_MIN = int(os.getenv("SERIES_POLL_GRACE_MIN", "0"))  # свежие эпизоды отдаём на откуп вебхуку
 # Посылать ли уведомление при ПЕРВОМ обнаружении сезона (по умолчанию нет)
 SERIES_POLL_INITIAL_ANNOUNCE = os.getenv("SERIES_POLL_INITIAL_ANNOUNCE", "1").lower() in ("1","true","yes","on")
 # Блокировать таймеры отправки на время сканирования библиотеки Jellyfin
-NOTIFY_BLOCK_DURING_SCAN = os.getenv("NOTIFY_BLOCK_DURING_SCAN", "1").lower() in ("1","true","yes","on")
+NOTIFY_BLOCK_DURING_SCAN = os.getenv("NOTIFY_BLOCK_DURING_SCAN", "0").lower() in ("1","true","yes","on")
 SCAN_RECHECK_DELAY_SEC = int(os.getenv("SCAN_RECHECK_DELAY_SEC", "5"))   # пауза между проверками
-MAX_SCAN_WAIT_MIN = int(os.getenv("MAX_SCAN_WAIT_MIN", "0"))             # 0 = ждать бесконечно
+MAX_SCAN_WAIT_MIN = int(os.getenv("MAX_SCAN_WAIT_MIN", "3"))             # 0 = ждать бесконечно
 # Какие имена задач считать «сканом» (нижний регистр, через запятую)
 SCAN_TASK_NAME_MATCH = [s.strip() for s in os.getenv(
     "SCAN_TASK_NAME_MATCH",
@@ -234,14 +234,14 @@ WHATSAPP_IMAGE_RETRY_ATTEMPTS = int(os.getenv("WHATSAPP_IMAGE_RETRY_ATTEMPTS", "
 WHATSAPP_IMAGE_RETRY_DELAY_SEC = int(os.getenv("WHATSAPP_IMAGE_RETRY_DELAY_SEC", "2"))
 # --- Episode/Season quality polling (по сериям -> уведомление на сезон) ---
 EP_QUALITY_POLL_ENABLED = (os.getenv("EP_QUALITY_POLL_ENABLED", "1").lower() in ("1","true","yes","on"))
-EP_QUALITY_POLL_INTERVAL_SEC = int(os.getenv("EP_QUALITY_POLL_INTERVAL_SEC", "240"))
-EP_QUALITY_POLL_PAGE_SIZE = int(os.getenv("EP_QUALITY_POLL_PAGE_SIZE", "300"))
+EP_QUALITY_POLL_INTERVAL_SEC = int(os.getenv("EP_QUALITY_POLL_INTERVAL_SEC", "120"))
+EP_QUALITY_POLL_PAGE_SIZE = int(os.getenv("EP_QUALITY_POLL_PAGE_SIZE", "10000"))
 EP_QUALITY_POLL_MAX_TOTAL = int(os.getenv("EP_QUALITY_POLL_MAX_TOTAL", "0"))  # 0 = без ограничения
 # Для "свежих" эпизодов можно переиспользовать SERIES_POLL_GRACE_MIN
 # Опрос музыкальных альбомов (по новым/изменённым альбомам)
 ALBUM_POLL_ENABLED = os.getenv("ALBUM_POLL_ENABLED", "1").lower() in ("1","true","yes","on")
 ALBUM_POLL_INTERVAL_SEC = int(os.getenv("ALBUM_POLL_INTERVAL_SEC", "300"))  # период, сек
-ALBUM_POLL_PAGE_SIZE = int(os.getenv("ALBUM_POLL_PAGE_SIZE", "500"))
+ALBUM_POLL_PAGE_SIZE = int(os.getenv("ALBUM_POLL_PAGE_SIZE", "2000"))
 ALBUM_POLL_MAX_TOTAL = int(os.getenv("ALBUM_POLL_MAX_TOTAL", "0"))  # 0 = без ограничения
 ALBUM_POLL_GRACE_MIN = int(os.getenv("ALBUM_POLL_GRACE_MIN", "0"))  # свежие альбомы отдаём вебхуку (у нас его нет) -> 0
 # Опциональный вывод списка треков в сообщении про новый альбом
@@ -251,13 +251,13 @@ ALBUM_TRACKLIST_SHOW_DURATION = os.getenv("ALBUM_TRACKLIST_SHOW_DURATION", "1").
 # --- Books poll ---
 BOOK_POLL_ENABLED = os.getenv("BOOK_POLL_ENABLED", "1").lower() in ("1","true","yes","on")
 BOOK_POLL_INTERVAL_SEC = int(os.getenv("BOOK_POLL_INTERVAL_SEC", "300"))
-BOOK_POLL_PAGE_SIZE = int(os.getenv("BOOK_POLL_PAGE_SIZE", "500"))
+BOOK_POLL_PAGE_SIZE = int(os.getenv("BOOK_POLL_PAGE_SIZE", "1000"))
 BOOK_POLL_MAX_TOTAL = int(os.getenv("BOOK_POLL_MAX_TOTAL", "0"))  # 0 = без ограничения
 BOOK_POLL_GRACE_MIN = int(os.getenv("BOOK_POLL_GRACE_MIN", "0"))  # 0 — сразу оповещаем кодом
 # --- MusicVideo (клипы) poll ---
 MVID_POLL_ENABLED = os.getenv("MVID_POLL_ENABLED", "1").lower() in ("1","true","yes","on")
 MVID_POLL_INTERVAL_SEC = int(os.getenv("MVID_POLL_INTERVAL_SEC", "300"))
-MVID_POLL_PAGE_SIZE = int(os.getenv("MVID_POLL_PAGE_SIZE", "500"))
+MVID_POLL_PAGE_SIZE = int(os.getenv("MVID_POLL_PAGE_SIZE", "1000"))
 MVID_POLL_MAX_TOTAL = int(os.getenv("MVID_POLL_MAX_TOTAL", "0"))  # 0 = без ограничения
 MVID_POLL_GRACE_MIN = int(os.getenv("MVID_POLL_GRACE_MIN", "0"))  # 0 — оповещаем сразу кодом
 # --- Outbound proxy for notifications ---
