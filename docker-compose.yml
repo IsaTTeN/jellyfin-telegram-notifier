@@ -2,9 +2,11 @@ version: '3'
 services:
   jellyfin-telegram-notifier:
     container_name: jellyfin-telegram-notifier
-    image: druidblack/jellyfin-telegram-notifie:latest
+    # Reemplazamos "image" por "build". 
+    # El punto (.) indica que el archivo "Dockerfile" está en la misma carpeta.
+    build: .
     ports:
-      - "5000:5000"  # Map host port 5000 to container port 5000
+      - "5000:5000"
     environment:
       - TELEGRAM_BOT_TOKEN=9059476951:AAGgchDa2cQq0XYK3Uki2IsGpQk1g4hPD7
       - TELEGRAM_CHAT_ID=501990748
@@ -15,3 +17,6 @@ services:
       - YOUTUBE_API_KEY=AIzTSygtyBFfMbzo8LTfwF8DDTmZshkFhaA8wWg
       - SEASON_ADDED_WITHIN_X_DAYS=3
       - EPISODE_PREMIERED_WITHIN_X_DAYS=7
+      - LANGUAGE=es
+      - TMDB_LANGUAGE=es-ES
+    restart: unless-stopped
